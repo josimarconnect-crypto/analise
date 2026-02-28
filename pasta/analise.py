@@ -1,55 +1,66 @@
 # -*- coding: utf-8 -*-
 """
-extrato_api.py (FastAPI) — Extrato por Produto (NCM/CFOP/CEST) via Portal SEFIN RO
+extrato_api.py — FastAPI (Render)
+✅ Rotas:
+- /health
+- /empresas?user=...
+- /debitos?user=...&codi=...&incluir_ano_anterior=1
+- /extrato-produto?user=...&codi=...&url_extrato=...&chave=...
 
-O que faz:
-- Recebe user (email do Bubble/Supabase) e url_extrato (extrato.jsp?inscricaoEstadual=...&numeroGuia=...)
-- Usa certificado (pem/key) do Supabase para autenticar no DET/Portal
-- Abre o extrato.jsp e extrai TOKEN + USUARIO/CPF (igual ao JS abrirCapaInternamento)
-- Monta a URL do Internamento: /capa_internamentos/<usuario>/<chave>?token=<token>
-- Segue redirects até /processamentos/show
-- Extrai a tabela "Itens da Nota" com NCM/CFOP/CEST e devolve JSON
-
-Deploy Render:
-- Start command: uvicorn extrato_api:app --host 0.0.0.0 --port $PORT
+✅ Login: DET -> Portal usando mTLS (cert pem/key do Supabase)
+✅ /extrato-produto:
+  abre extrato.jsp, extrai TOKEN + USUARIO e CHAVE (44 dígitos)
+  monta capa_internamentos e segue até processamentos/show
+  extrai "Itens da Nota" com NCM/CFOP/CEST/Produto SEFIN (quando existir)
 """
+
+from __future__ import annotations
 
 import os
 import re
-import json
 import base64
 import tempfile
 import traceback
 import logging
 from logging.handlers import RotatingFileHandler
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Dict, Any, Optional, List, Tuple
 from urllib.parse import urlparse, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
 
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import uvicorn
 
 
-# =========================
+# =========================================================
 # CONFIG
-# =========================
-SUPABASE_URL = "https://hysrxadnigzqadnlkynq.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"
-TABELA_CERTS = os.getenv("TABELA_CERTS", "certifica_dfe")
+# =========================================================
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://hysrxadnigzqadnlkynq.supabase.co").strip()
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
+TABELA_CERTS = os.getenv("TABELA_CERTS", "certifica_dfe").strip()
 
+DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "1") == "1"
+LOG_FILE = os.getenv("LOG_FILE", "/tmp/extrato_api.log" if os.getenv("RENDER") else "extrato_api.log")
+
+# URLs DET / PORTAL / INTERNAMENTO
 URL_DET_HOME = "https://detsec.sefin.ro.gov.br/certificados"
 URL_ENTRAR = "https://detsec.sefin.ro.gov.br/entrar"
 URL_REDIRECT_PORTAL = "https://detsec.sefin.ro.gov.br/contribuinte/notificacoes/redirect_portal"
 URL_PORTAL_HOME_DEFAULT = "https://portalcontribuinte.sefin.ro.gov.br/app/home/?exibir_modal=true"
 
+URL_CONSULTA_DEBITOS = "https://portalcontribuinte.sefin.ro.gov.br/app/consultadebitos/"
+URL_CONSULTA_DEBITOS_LISTA = "https://portalcontribuinte.sefin.ro.gov.br/app/consultadebitos/lista.jsp"
+
 BASE_INTERNAMENTO = "https://internamentonotas.sefin.ro.gov.br"
 
-DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "1") == "1"
-LOG_FILE = os.getenv("LOG_FILE", "/tmp/extrato_api.log" if os.getenv("RENDER") else "extrato_api.log")
 
+# =========================================================
+# LOG
+# =========================================================
 logger = logging.getLogger("extrato_api")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
@@ -69,43 +80,135 @@ def _log_exc(prefix: str, exc: Exception):
         pass
 
 
+def _require_supabase():
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise HTTPException(status_code=500, detail="Configure SUPABASE_URL e SUPABASE_KEY no ENV do Render.")
+
+
 def supabase_headers() -> Dict[str, str]:
-    if not SUPABASE_KEY:
-        raise HTTPException(status_code=500, detail="SUPABASE_KEY não configurada no ENV.")
+    _require_supabase()
     return {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
 
 
-def carregar_certificado_por_user_e_codi(user_email: str, codi: Optional[str]) -> Dict[str, Any]:
-    """
-    Busca 1 certificado (pem/key) no Supabase.
-    Se codi vier vazio, pega o primeiro.
-    """
+# =========================================================
+# APP
+# =========================================================
+app = FastAPI(title="API Débitos + Extrato por Produto (NCM) — SEFIN RO")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=".*",
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    try:
+        logger.error(
+            "UNHANDLED | path=%s | query=%s | err=%s\n%s",
+            str(request.url.path),
+            dict(request.query_params),
+            str(exc),
+            traceback.format_exc(),
+        )
+    except Exception:
+        pass
+
+    if not DEBUG_ERRORS:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
+
+    return JSONResponse(
+        status_code=500,
+        content={
+            "ok": False,
+            "error": str(exc),
+            "type": exc.__class__.__name__,
+            "path": str(request.url.path),
+            "query": dict(request.query_params),
+            "traceback": traceback.format_exc(),
+            "log_file": LOG_FILE,
+        },
+    )
+
+
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "service": "extrato_api",
+        "date_utc": _now_iso(),
+        "routes": ["/health", "/empresas", "/debitos", "/extrato-produto"],
+        "log_file": LOG_FILE,
+    }
+
+
+@app.get("/health")
+def health():
+    return {"ok": True, "date_utc": _now_iso()}
+
+
+# =========================================================
+# SUPABASE CERTS
+# =========================================================
+def carregar_certificados(user_filter: str) -> List[Dict[str, Any]]:
     url = f"{SUPABASE_URL}/rest/v1/{TABELA_CERTS}"
     params: Dict[str, str] = {
         "select": 'id,pem,key,empresa,codi,user,vencimento,"cnpj/cpf"',
-        "user": f"eq.{user_email}",
-        "limit": "50",
+        "user": f"eq.{user_filter}",
+        "order": "id.desc",
+        "limit": "100",
     }
     r = requests.get(url, headers=supabase_headers(), params=params, timeout=30)
-    r.raise_for_status()
-    rows = r.json() or []
-    if not rows:
-        raise HTTPException(status_code=404, detail="Nenhum certificado encontrado para este user.")
-
-    if codi:
-        codi = str(codi).strip()
-        for row in rows:
-            if str(row.get("codi") or "").strip() == codi:
-                return row
-
-        raise HTTPException(status_code=404, detail=f"Nenhum certificado encontrado para o CODI={codi}.")
-
-    return rows[0]
+    if r.status_code >= 300:
+        raise HTTPException(status_code=400, detail=f"Supabase REST falhou: {r.text}")
+    return r.json() or []
 
 
+def selecionar_cert_por_codi(certs: List[Dict[str, Any]], codi: str) -> Dict[str, Any]:
+    codi = (codi or "").strip()
+    if not codi:
+        return certs[0]
+    for c in certs:
+        if str(c.get("codi") or "").strip() == codi:
+            return c
+    raise HTTPException(status_code=404, detail=f"Não encontrei certificado com CODI={codi} para este user.")
+
+
+@app.get("/empresas")
+def empresas(user: str = Query(...)):
+    if not user or "@" not in user:
+        raise HTTPException(status_code=400, detail="user inválido.")
+    certs = carregar_certificados(user)
+    out = []
+    seen = set()
+    for c in certs:
+        codi = str(c.get("codi") or "").strip()
+        if not codi or codi in seen:
+            continue
+        seen.add(codi)
+        out.append({
+            "codi": codi,
+            "empresa": (c.get("empresa") or "").strip(),
+            "cnpj": (c.get("cnpj/cpf") or "").strip(),
+            "vencimento": (c.get("vencimento") or ""),
+        })
+    return {"ok": True, "user": user, "total": len(out), "empresas": out}
+
+
+# =========================================================
+# CERT TEMP + SESSION
+# =========================================================
 def criar_arquivos_cert_temp(cert_row: Dict[str, Any]) -> Tuple[str, str]:
-    pem_bytes = base64.b64decode(cert_row.get("pem") or "")
-    key_bytes = base64.b64decode(cert_row.get("key") or "")
+    pem_b64 = cert_row.get("pem") or ""
+    key_b64 = cert_row.get("key") or ""
+    if not pem_b64 or not key_b64:
+        raise HTTPException(status_code=400, detail="Certificado inválido: pem/key vazios no Supabase.")
+
+    pem_bytes = base64.b64decode(pem_b64)
+    key_bytes = base64.b64decode(key_b64)
 
     cert_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pem")
     key_file = tempfile.NamedTemporaryFile(delete=False, suffix=".key")
@@ -119,22 +222,20 @@ def criar_arquivos_cert_temp(cert_row: Dict[str, Any]) -> Tuple[str, str]:
 def criar_sessao(cert_path: str, key_path: str) -> requests.Session:
     s = requests.Session()
     s.cert = (cert_path, key_path)
-    s.headers.update(
-        {
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        }
-    )
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
     return s
 
 
-# =========================
-# LOGIN DET -> PORTAL
-# =========================
+# =========================================================
+# DET / PORTAL
+# =========================================================
 def abrir_acesso_digital_e_entrar(sess: requests.Session) -> bool:
     r = sess.get(URL_DET_HOME, timeout=30, allow_redirects=True)
     if r.status_code != 200:
@@ -150,10 +251,10 @@ def abrir_acesso_digital_e_entrar(sess: requests.Session) -> bool:
         action = requests.compat.urljoin(URL_DET_HOME, action)
 
     r_ent = sess.get(action, timeout=30, allow_redirects=True)
-    if r_ent.status_code != 200 or "/certificado/acessos" not in r_ent.url:
+    if r_ent.status_code != 200:
         return False
 
-    return True
+    return ("/certificado/acessos" in (r_ent.url or ""))
 
 
 def _extrair_form_logintoken(html: str) -> Tuple[Optional[str], Optional[Dict[str, str]]]:
@@ -182,57 +283,192 @@ def _extrair_redirect_do_logintoken(html: str) -> Optional[str]:
     return None
 
 
-def ir_para_portal_e_carregar_home(sess: requests.Session) -> Optional[str]:
+def ir_para_portal(sess: requests.Session) -> bool:
     r_red = sess.get(URL_REDIRECT_PORTAL, timeout=30, allow_redirects=True)
     if r_red.status_code != 200:
-        return None
+        return False
 
     action_form, data_form = _extrair_form_logintoken(r_red.text)
     if action_form:
         r_login = sess.post(action_form, data=data_form, timeout=30, allow_redirects=True)
-        if r_login.status_code == 200 and "LoginToken" not in r_login.url:
-            return r_login.text
-        if r_login.status_code == 200 and "LoginToken" in r_login.url:
+        if r_login.status_code == 200 and "LoginToken" not in (r_login.url or ""):
+            return True
+        if r_login.status_code == 200 and "LoginToken" in (r_login.url or ""):
             next_url = _extrair_redirect_do_logintoken(r_login.text) or URL_PORTAL_HOME_DEFAULT
             r_home = sess.get(next_url, timeout=30, allow_redirects=True)
-            if r_home.status_code == 200 and "portalcontribuinte.sefin.ro.gov.br" in r_home.url:
-                return r_home.text
-
+            return (r_home.status_code == 200 and "portalcontribuinte.sefin.ro.gov.br" in (r_home.url or ""))
     r_portal = sess.get(URL_PORTAL_HOME_DEFAULT, timeout=30, allow_redirects=True)
-    if r_portal.status_code == 200 and "LoginToken" not in r_portal.url:
-        return r_portal.text
-
-    return None
+    return (r_portal.status_code == 200 and "LoginToken" not in (r_portal.url or ""))
 
 
-# =========================
-# EXTRATO.JSP -> TOKEN/USUARIO/CHAVE
-# =========================
-def _parse_url_extrato_params(url_extrato: str) -> Dict[str, str]:
+# =========================================================
+# DÉBITOS
+# =========================================================
+def _listar_inscricoes_estaduais(html: str) -> List[str]:
+    soup = BeautifulSoup(html, "lxml")
+    sel_ie = soup.find("select", {"name": "inscricaoEstadual"})
+    if not sel_ie:
+        return []
+    vals = []
+    for opt in sel_ie.find_all("option"):
+        v = (opt.get("value") or "").strip()
+        if v:
+            vals.append(v)
+    out, seen = [], set()
+    for v in vals:
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+    return out
+
+
+def obter_debitos_inscricao_estadual(html_deb: str) -> List[Dict[str, str]]:
+    soup = BeautifulSoup(html_deb, "lxml")
+    tabela_alvo = None
+    for tab in soup.find_all("table"):
+        ths = tab.find_all("th")
+        if not ths:
+            continue
+        if "DÉBITOS NA INSCRIÇÃO ESTADUAL" in ths[0].get_text(" ", strip=True).upper():
+            tabela_alvo = tab
+            break
+    if not tabela_alvo:
+        return []
+
+    linhas = tabela_alvo.find_all("tr")
+    if len(linhas) <= 2:
+        return []
+
+    debitos: List[Dict[str, str]] = []
+    for tr in linhas[2:]:
+        tds = tr.find_all("td")
+        if len(tds) < 11:
+            continue
+
+        def txt(i: int) -> str:
+            return tds[i].get_text(" ", strip=True) if i < len(tds) else ""
+
+        link_extrato = tr.find("a", href=re.compile(r"extrato\.jsp"))
+
+        def norm_url(href: Optional[str]) -> str:
+            if not href:
+                return ""
+            href = href.replace("%22", "").strip('"')
+            if href.startswith("http"):
+                return href
+            return requests.compat.urljoin(URL_CONSULTA_DEBITOS_LISTA, href)
+
+        debitos.append({
+            "nr_lancamento": txt(2),
+            "parcela": txt(3),
+            "referencia": txt(4),
+            "complemento": txt(5),
+            "receita": txt(6),
+            "situacao": txt(7),
+            "data_vencimento": txt(8),
+            "valor_lancamento": txt(9),
+            "valor_atualizado": txt(10),
+            "url_extrato": norm_url(link_extrato.get("href") if link_extrato else ""),
+        })
+
+    return debitos
+
+
+def consultar_debitos_ano(sess: requests.Session, ano: int) -> Tuple[List[Dict[str, str]], Optional[str]]:
+    r = sess.get(URL_CONSULTA_DEBITOS, timeout=30, allow_redirects=True)
+    if r.status_code != 200:
+        return [], f"Erro HTTP {r.status_code} ao abrir Consulta de Débitos"
+
+    soup = BeautifulSoup(r.text, "lxml")
+    input_tipo = soup.find("input", {"name": "tipoDevedor"})
+    tipo_devedor = input_tipo.get("value", "1") if input_tipo else "1"
+
+    inscricoes = _listar_inscricoes_estaduais(r.text)
+    if not inscricoes:
+        return [], "Nenhuma inscrição estadual disponível (select vazio)"
+
+    last_err = None
+    for ie_val in inscricoes:
+        payload = {
+            "inscricaoEstadual": ie_val,
+            "ano": str(ano),
+            "tipoDevedor": tipo_devedor,
+            "Submit": "Consultar Débitos",
+        }
+        r2 = sess.post(URL_CONSULTA_DEBITOS_LISTA, data=payload, timeout=30, allow_redirects=True)
+        if r2.status_code != 200:
+            last_err = f"Erro HTTP {r2.status_code} lista (ano {ano}) IE={ie_val}"
+            continue
+
+        debs = obter_debitos_inscricao_estadual(r2.text)
+        for d in debs:
+            d["ano"] = str(ano)
+            d["ie"] = ie_val
+        return debs, None
+
+    return [], last_err or f"Falha ao consultar lista (ano {ano})"
+
+
+@app.get("/debitos")
+def route_debitos(
+    user: str = Query(...),
+    codi: str = Query(...),
+    incluir_ano_anterior: int = Query(1),
+):
     """
-    Ex: extrato.jsp?PrimeiraVez=S&inscricaoEstadual=00000006598307&numeroGuia=20261600155408
+    ✅ Essa é a rota que estava dando 404 no seu deploy.
     """
-    pr = urlparse(url_extrato)
-    qs = parse_qs(pr.query)
-    insc = (qs.get("inscricaoEstadual", [""])[0] or "").strip()
-    guia = (qs.get("numeroGuia", [""])[0] or "").strip()
-    return {"inscricaoEstadual": insc, "numeroGuia": guia}
+    if not user or "@" not in user:
+        raise HTTPException(status_code=400, detail="user inválido.")
+    if not codi:
+        raise HTTPException(status_code=400, detail="codi obrigatório.")
+
+    certs = carregar_certificados(user)
+    cert = selecionar_cert_por_codi(certs, codi)
+
+    cert_path = key_path = None
+    try:
+        cert_path, key_path = criar_arquivos_cert_temp(cert)
+        sess = criar_sessao(cert_path, key_path)
+
+        if not abrir_acesso_digital_e_entrar(sess):
+            raise HTTPException(status_code=401, detail="Falha ao entrar no DET (mTLS).")
+        if not ir_para_portal(sess):
+            raise HTTPException(status_code=401, detail="Falha ao abrir Portal.")
+
+        ano_atual = date.today().year
+        anos = [ano_atual] + ([ano_atual - 1] if incluir_ano_anterior == 1 else [])
+
+        all_debs: List[Dict[str, str]] = []
+        for a in anos:
+            debs, _ = consultar_debitos_ano(sess, a)
+            all_debs.extend(debs or [])
+
+        return {
+            "ok": True,
+            "user": user,
+            "codi": str(cert.get("codi") or ""),
+            "empresa": (cert.get("empresa") or ""),
+            "debitos": all_debs,
+        }
+
+    finally:
+        for p in (cert_path, key_path):
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
 
 
+# =========================================================
+# EXTRATO -> TOKEN/USUARIO/CHAVE
+# =========================================================
 def _extrair_token_e_usuario_do_html_extrato(html_extrato: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    No HTML do extrato.jsp, existe a função:
-      var TOKEN = '...';
-      var CPF_CLIENTE = ('06311645297' || '').replace(/\D/g, '');
-      var USUARIO = CPF_CLIENTE;
-
-    Isso é exatamente o que precisamos (mesma lógica do "abrir em outra aba"). :contentReference[oaicite:4]{index=4}
-    """
-    # TOKEN
     m1 = re.search(r"var\s+TOKEN\s*=\s*'([^']+)'", html_extrato)
     token = m1.group(1).strip() if m1 else None
 
-    # CPF/USUARIO (usa "Olá <strong>06311645297 - ...</strong>")
     m2 = re.search(r"Ol[áa]\s*<strong>\s*([0-9]{11})\s*-", html_extrato, flags=re.I)
     usuario = m2.group(1).strip() if m2 else None
 
@@ -240,10 +476,6 @@ def _extrair_token_e_usuario_do_html_extrato(html_extrato: str) -> Tuple[Optiona
 
 
 def _extrair_chaves_do_extrato(html_extrato: str) -> List[str]:
-    """
-    A tabela do extrato.jsp tem linhas com a chave NFe no 1º TD (150 width no HTML salvo). :contentReference[oaicite:5]{index=5}
-    Vamos coletar todas as chaves (44 dígitos).
-    """
     chaves = re.findall(r"\b\d{44}\b", html_extrato)
     out, seen = [], set()
     for c in chaves:
@@ -261,38 +493,36 @@ def _montar_url_capa_internamento(usuario: str, chave: str, token: Optional[str]
     return base
 
 
-# =========================
+# =========================================================
 # INTERNAMENTO -> ITENS COM NCM
-# =========================
+# =========================================================
+def _extract_table_headers(table) -> List[str]:
+    ths = table.find_all("th")
+    if ths:
+        return [th.get_text(" ", strip=True) for th in ths]
+    tr = table.find("tr")
+    if tr:
+        cells = tr.find_all(["td", "th"])
+        return [c.get_text(" ", strip=True) for c in cells]
+    return []
+
+
 def _score_headers(headers: List[str]) -> int:
     h = " | ".join([x.strip().lower() for x in headers if x]).lower()
     score = 0
     for kw, pts in [
-        ("itens da nota", 50),
-        ("ncm", 40),
-        ("cfop", 25),
+        ("itens da nota", 60),
+        ("ncm", 50),
+        ("cfop", 30),
         ("cest", 20),
         ("produto sefin", 20),
-        ("produto", 8),
-        ("descr", 8),
-        ("valor", 5),
+        ("descricao", 10),
+        ("descr", 10),
+        ("item", 10),
     ]:
         if kw in h:
             score += pts
     return score
-
-
-def _extract_table_headers(table) -> List[str]:
-    # tenta th primeiro
-    ths = table.find_all("th")
-    if ths:
-        return [th.get_text(" ", strip=True) for th in ths]
-    # fallback: primeira linha tds
-    tr = table.find("tr")
-    if tr:
-        tds = tr.find_all("td")
-        return [td.get_text(" ", strip=True) for td in tds]
-    return []
 
 
 def _pick_best_items_table(html_internamento: str) -> Tuple[Optional[Any], Dict[str, Any]]:
@@ -305,7 +535,7 @@ def _pick_best_items_table(html_internamento: str) -> Tuple[Optional[Any], Dict[
     for i, t in enumerate(tables):
         headers = _extract_table_headers(t)
         sc = _score_headers(headers)
-        diag["scores"].append({"i": i, "score": sc, "headers_sample": headers[:30]})
+        diag["scores"].append({"i": i, "score": sc, "headers_sample": headers[:25]})
         if sc > best_score:
             best_score = sc
             best = t
@@ -314,53 +544,25 @@ def _pick_best_items_table(html_internamento: str) -> Tuple[Optional[Any], Dict[
     return best, diag
 
 
-def _parse_decimal_br(s: str) -> Optional[float]:
-    if not s:
-        return None
-    s = s.strip()
-    # remove tudo que não dígito, ponto, vírgula, menos
-    s = re.sub(r"[^0-9,\.-]+", "", s)
-    if not s:
-        return None
-    # padrão BR: 5.633,65
-    if "," in s and "." in s:
-        s = s.replace(".", "").replace(",", ".")
-    elif "," in s and "." not in s:
-        s = s.replace(",", ".")
-    try:
-        return float(s)
-    except Exception:
-        return None
-
-
 def _parse_items_from_table(table) -> List[Dict[str, Any]]:
-    """
-    Lê linhas (tr) e tenta mapear colunas do jeito mais robusto possível.
-    Se a tabela tiver header "NCM/CFOP/CEST", vamos localizar índices por nome.
-    """
-    # header “de verdade” geralmente fica num thead ou nas primeiras linhas
-    # vamos montar um header linear e procurar índices
     all_tr = table.find_all("tr")
     if not all_tr:
         return []
 
-    # coleta uma linha de header “boa”
-    header_cells = []
+    header_cells: List[str] = []
     header_tr = None
-    for tr in all_tr[:8]:
+    for tr in all_tr[:10]:
         ths = tr.find_all("th")
         if ths and len(ths) >= 6:
             header_cells = [th.get_text(" ", strip=True) for th in ths]
             header_tr = tr
             break
 
-    # se não achou, tenta primeiro tr com tds
     if not header_cells:
-        tds = all_tr[0].find_all(["td", "th"])
-        header_cells = [x.get_text(" ", strip=True) for x in tds]
+        cells = all_tr[0].find_all(["td", "th"])
+        header_cells = [c.get_text(" ", strip=True) for c in cells]
         header_tr = all_tr[0]
 
-    # normaliza header
     hnorm = [re.sub(r"\s+", " ", (h or "").strip()).lower() for h in header_cells]
 
     def find_idx(*names: str) -> Optional[int]:
@@ -376,9 +578,8 @@ def _parse_items_from_table(table) -> List[Dict[str, Any]]:
     idx_cfop = find_idx("cfop")
     idx_cest = find_idx("cest")
     idx_ncm = find_idx("ncm")
-    idx_prod_sefin = find_idx("produto sefin", "produto  sefin", "produto sefin sugerido", "produto sefin sugerida")
+    idx_prod_sefin = find_idx("produto sefin")
 
-    # se o layout tiver colunas repetidas de "valor", a gente guarda um snapshot de todas as colunas também
     items: List[Dict[str, Any]] = []
     for tr in all_tr:
         if tr == header_tr:
@@ -388,14 +589,11 @@ def _parse_items_from_table(table) -> List[Dict[str, Any]]:
             continue
 
         cols = [td.get_text(" ", strip=True) for td in tds]
-        # ignora linhas muito curtas
         if len(cols) < 6:
             continue
 
         def get(i: Optional[int]) -> Optional[str]:
-            if i is None:
-                return None
-            if i < 0 or i >= len(cols):
+            if i is None or i >= len(cols):
                 return None
             v = (cols[i] or "").strip()
             return v or None
@@ -407,19 +605,12 @@ def _parse_items_from_table(table) -> List[Dict[str, Any]]:
             "cest": get(idx_cest),
             "ncm": get(idx_ncm),
             "produto_sefin": get(idx_prod_sefin),
-            "cols_raw": cols,  # para diagnóstico / auditoria
+            "cols_raw": cols,
         }
 
-        # tenta extrair alguns valores numéricos “comuns”
-        # (não depende de posição fixa; serve para você tratar depois)
-        nums = []
-        for c in cols:
-            f = _parse_decimal_br(c)
-            if f is not None:
-                nums.append(f)
-        item["nums_detectados"] = nums[:30]
-
-        # se não parece item (sem descrição e sem ncm), pula
+        # só aceita se parece linha de item
+        if not (item["item"] and re.fullmatch(r"\d+", item["item"] or "")):
+            continue
         if not (item["descricao"] or item["ncm"] or item["produto_sefin"]):
             continue
 
@@ -428,95 +619,59 @@ def _parse_items_from_table(table) -> List[Dict[str, Any]]:
     return items
 
 
-# =========================
-# API
-# =========================
-app = FastAPI(title="Extrato por Produto (NCM) — SEFIN RO")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=".*",
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.get("/health")
-def health():
-    return {"ok": True, "now": _now_iso(), "log_file": LOG_FILE}
-
-
 @app.get("/extrato-produto")
 def extrato_produto(
-    user: str = Query(..., description="email do user (igual no Supabase)"),
-    codi: str = Query("", description="CODI opcional para selecionar a empresa"),
-    url_extrato: str = Query(..., description="URL do extrato.jsp (a do botão/linha do débito)"),
-    chave: str = Query("", description="chave NFe (opcional) — se vazio usa a primeira detectada"),
+    user: str = Query(...),
+    codi: str = Query(...),
+    url_extrato: str = Query(...),
+    chave: str = Query(""),
 ):
-    """
-    Retorna os itens do internamento com NCM/CFOP/CEST (por produto).
-    """
-    job = datetime.now().strftime("%Y%m%d%H%M%S")
-    logger.info("START | job=%s | user=%s | codi=%s", job, user, codi or "-")
+    if not user or "@" not in user:
+        raise HTTPException(status_code=400, detail="user inválido.")
+    if not codi:
+        raise HTTPException(status_code=400, detail="codi obrigatório.")
+    if not url_extrato.startswith("http"):
+        raise HTTPException(status_code=400, detail="url_extrato deve começar com http/https.")
 
-    cert = carregar_certificado_por_user_e_codi(user, codi or None)
+    certs = carregar_certificados(user)
+    cert = selecionar_cert_por_codi(certs, codi)
 
     cert_path = key_path = None
     try:
         cert_path, key_path = criar_arquivos_cert_temp(cert)
         sess = criar_sessao(cert_path, key_path)
 
-        # login DET/Portal
         if not abrir_acesso_digital_e_entrar(sess):
-            raise HTTPException(status_code=400, detail="Falha ao entrar no Acesso Digital (DET).")
-        if not ir_para_portal_e_carregar_home(sess):
-            raise HTTPException(status_code=400, detail="Falha ao abrir Portal (home).")
+            raise HTTPException(status_code=401, detail="Falha ao entrar no DET (mTLS).")
+        if not ir_para_portal(sess):
+            raise HTTPException(status_code=401, detail="Falha ao abrir Portal (LoginToken/home).")
 
-        # abre extrato.jsp
-        # (se vier url com aspas ou # no final, limpamos)
         url_extrato_clean = (url_extrato or "").strip().replace("%22", "").split("#", 1)[0]
-        r = sess.get(url_extrato_clean, timeout=30, allow_redirects=True)
+        r = sess.get(url_extrato_clean, timeout=45, allow_redirects=True)
         if r.status_code != 200:
             raise HTTPException(status_code=400, detail=f"Erro ao abrir extrato.jsp: HTTP {r.status_code}")
 
         html_extrato = r.text
-
         token, usuario = _extrair_token_e_usuario_do_html_extrato(html_extrato)
         if not usuario:
             raise HTTPException(status_code=400, detail="Não consegui extrair USUARIO/CPF do extrato.jsp.")
-        # token às vezes pode ser vazio; tentamos mesmo assim
-        if not token:
-            logger.warning("WARN | job=%s | token não encontrado no extrato.jsp", job)
 
-        # chaves do extrato (tabela principal)
         chaves = _extrair_chaves_do_extrato(html_extrato)
         if not chaves:
             raise HTTPException(status_code=400, detail="Nenhuma chave NFe (44 dígitos) encontrada no extrato.jsp.")
 
-        chave_alvo = (chave or "").strip()
-        if chave_alvo:
-            if chave_alvo not in chaves:
-                logger.warning("WARN | job=%s | chave informada não está na lista detectada; seguindo mesmo assim", job)
-        else:
-            chave_alvo = chaves[0]
-
-        # monta URL do internamento igual ao JS abrirCapaInternamento :contentReference[oaicite:6]{index=6}
+        chave_alvo = (chave or "").strip() or chaves[0]
         url_capa = _montar_url_capa_internamento(usuario=usuario, chave=chave_alvo, token=token)
-        logger.info("CAPA | job=%s | url=%s", job, url_capa)
 
-        # abre internamento (segue redirects até processamentos/show) :contentReference[oaicite:7]{index=7}
-        r2 = sess.get(url_capa, timeout=45, allow_redirects=True)
+        r2 = sess.get(url_capa, timeout=60, allow_redirects=True)
         if r2.status_code != 200:
             raise HTTPException(status_code=400, detail=f"Falha ao abrir internamento: HTTP {r2.status_code}")
 
         html_intern = r2.text
         final_url = r2.url
 
-        # acha tabela “Itens da Nota” (onde tem NCM/CFOP/CEST)
         table, diag = _pick_best_items_table(html_intern)
-        if not table or (diag.get("best_score", 0) < 40):
-            # devolve diagnóstico para ajustar rápido
+        if not table or (diag.get("best_score", 0) < 60):
             return {
                 "ok": True,
                 "user": user,
@@ -524,22 +679,14 @@ def extrato_produto(
                 "empresa": cert.get("empresa") or "",
                 "result": {
                     "ok": False,
-                    "message": "Não consegui localizar a tabela de Itens da Nota (NCM/CFOP/CEST) no internamento.",
+                    "message": "Não consegui localizar a tabela de Itens da Nota (NCM/CFOP/CEST).",
                     "final_url": final_url,
-                    "diag": diag,
+                    "diagnostico": diag,
                 },
             }
 
         itens = _parse_items_from_table(table)
-
-        # totais básicos
-        itens_sem_ncm = sum(1 for x in itens if not x.get("ncm"))
-        totals = {
-            "qtd_itens": len(itens),
-            "itens_sem_ncm": itens_sem_ncm,
-        }
-
-        out = {
+        return {
             "ok": True,
             "user": user,
             "codi": str(cert.get("codi") or ""),
@@ -551,21 +698,11 @@ def extrato_produto(
                 "usuario": usuario,
                 "chave": chave_alvo,
                 "itens": itens,
-                "totais": totals,
+                "totais": {"qtd_itens": len(itens), "itens_sem_ncm": sum(1 for x in itens if not x.get("ncm"))},
                 "diagnostico": diag,
             },
         }
 
-        logger.info("DONE | job=%s | itens=%s | sem_ncm=%s", job, len(itens), itens_sem_ncm)
-        return out
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        _log_exc(f"FAIL | job={job}", e)
-        if DEBUG_ERRORS:
-            raise HTTPException(status_code=500, detail={"error": str(e), "traceback": traceback.format_exc(), "log_file": LOG_FILE})
-        raise HTTPException(status_code=500, detail=str(e))
     finally:
         for p in (cert_path, key_path):
             try:
@@ -575,7 +712,5 @@ def extrato_produto(
                 pass
 
 
-# Render/local
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("extrato_api:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+    uvicorn.run("extrato_api:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
