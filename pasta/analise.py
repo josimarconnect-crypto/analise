@@ -1,283 +1,21 @@
-from __future__ import annotations
-
-import os
-import re
-import base64
-import tempfile
-import traceback
-import logging
-from logging.handlers import RotatingFileHandler
-from datetime import date, datetime, timezone
-from typing import Dict, Any, Optional, List, Tuple
-
-import requests
-from bs4 import BeautifulSoup
-from fastapi import FastAPI, Query, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-import uvicorn
-
-
-# =========================================================
-# CONFIG
-# =========================================================
-SUPABASE_URL = "https://hysrxadnigzqadnlkynq.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"
-TABELA_CERTS = os.getenv("TABELA_CERTS", "certifica_dfe").strip()
-
-DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "1") == "1"
-LOG_FILE = os.getenv("LOG_FILE", "/tmp/extrato_api.log")
-
-URL_DET_HOME = "https://detsec.sefin.ro.gov.br/certificados"
-URL_ENTRAR = "https://detsec.sefin.ro.gov.br/entrar"
-URL_REDIRECT_PORTAL = "https://detsec.sefin.ro.gov.br/contribuinte/notificacoes/redirect_portal"
-URL_PORTAL_HOME_DEFAULT = "https://portalcontribuinte.sefin.ro.gov.br/app/home/?exibir_modal=true"
-
-BASE_INTERNAMENTO = "https://internamentonotas.sefin.ro.gov.br"
-
-
-# =========================================================
-# LOG
-# =========================================================
-logger = logging.getLogger("extrato_api")
-logger.setLevel(logging.INFO)
-
-if not logger.handlers:
-    fh = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-    logger.addHandler(fh)
-
-
-def _now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def supabase_headers():
-    return {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-
-
-# =========================================================
-# APP
-# =========================================================
-app = FastAPI(title="API Débitos + Extrato por Produto — SEFIN RO")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=".*",
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# =========================================================
-# CERTIFICADO
-# =========================================================
-def criar_arquivos_cert_temp(cert_row):
-    pem = base64.b64decode(cert_row["pem"])
-    key = base64.b64decode(cert_row["key"])
-
-    cert_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pem")
-    key_file = tempfile.NamedTemporaryFile(delete=False, suffix=".key")
-
-    cert_file.write(pem)
-    key_file.write(key)
-
-    cert_file.close()
-    key_file.close()
-
-    return cert_file.name, key_file.name
-
-
-def criar_sessao(cert_path, key_path):
-    s = requests.Session()
-    s.cert = (cert_path, key_path)
-    s.headers.update({"User-Agent": "Mozilla/5.0"})
-    return s
-
-
-# =========================================================
-# SCORE CÁLCULO ITENS (CORRIGIDO)
-# =========================================================
-def _score_headers_calculo(headers: List[str]) -> int:
-    h = " | ".join([re.sub(r"\s+", " ", x).lower() for x in headers])
-
-    score = 0
-    for kw, pts in [
-        ("% alíq. interna", 150),
-        ("frete fob", 120),
-        ("base calc. final", 150),
-        ("val. crédito nfe", 100),
-        ("val. débito mercadoria", 100),
-        ("val. a recolher", 200),
-        ("val a recolher", 200),
-        ("item", 20),
-        ("produto", 20),
-    ]:
-        if kw in h:
-            score += pts
-
-    return score
-
-
-# =========================================================
-# PICK TABELA
-# =========================================================
-def _extract_table_headers(table):
-    ths = table.find_all("th")
-    return [th.get_text(" ", strip=True) for th in ths]
-
-
-def _pick_best_table(html, scorer):
-    soup = BeautifulSoup(html, "lxml")
-    tables = soup.find_all("table")
-
-    best = None
-    best_score = -1
-
-    for t in tables:
-        headers = _extract_table_headers(t)
-        sc = scorer(headers)
-        if sc > best_score:
-            best_score = sc
-            best = t
-
-    return best, best_score
-
-
-# =========================================================
-# PARSE CÁLCULO ITENS
-# =========================================================
-def _parse_calculo_itens(table):
-    rows = table.find_all("tr")
-
-    header = [th.get_text(" ", strip=True).lower() for th in rows[0].find_all("th")]
-
-    def idx(name):
-        for i, h in enumerate(header):
-            if name in h:
-                return i
-        return None
-
-    idx_item = idx("item")
-    idx_recolher = idx("recolher")
-    idx_base_final = idx("base calc. final")
-    idx_aliq = idx("interna")
-    idx_val_merc = idx("mercadoria")
-
-    out = []
-
-    for tr in rows[1:]:
-        cols = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
-        if not cols:
-            continue
-
-        item = cols[idx_item] if idx_item is not None else None
-        if not item or not item.isdigit():
-            continue
-
-        out.append({
-            "item": item,
-            "base_calc_final": cols[idx_base_final] if idx_base_final is not None else None,
-            "aliq_interna": cols[idx_aliq] if idx_aliq is not None else None,
-            "val_mercadoria": cols[idx_val_merc] if idx_val_merc is not None else None,
-            "valor_a_recolher": cols[idx_recolher] if idx_recolher is not None else None,
-        })
-
-    return out
-
-
-# =========================================================
-# MERGE
-# =========================================================
-def _merge_por_item(itens_nota, calc):
-    calc_map = {c["item"]: c for c in calc}
-
-    merged = []
-
-    for it in itens_nota:
-        item_id = it.get("item")
-        c = calc_map.get(item_id)
-
-        new = dict(it)
-
-        if c:
-            new["calc_base_calc_final"] = c.get("base_calc_final")
-            new["calc_aliq_interna"] = c.get("aliq_interna")
-            new["calc_val_mercadoria"] = c.get("val_mercadoria")
-            new["calc_valor_a_recolher"] = c.get("valor_a_recolher")
-        else:
-            new["calc_valor_a_recolher"] = None
-
-        merged.append(new)
-
-    return merged
-
-
-# =========================================================
-# ROTA EXTRATO PRODUTO
-# =========================================================
-@app.get("/extrato-produto")
-def extrato_produto(
-    user: str = Query(...),
-    codi: str = Query(...),
-    url_extrato: str = Query(...),
-):
-
-    certs = requests.get(
-        f"{SUPABASE_URL}/rest/v1/{TABELA_CERTS}",
-        headers=supabase_headers(),
-        params={"user": f"eq.{user}"}
-    ).json()
-
-    cert = next((c for c in certs if str(c.get("codi")) == codi), None)
-    if not cert:
-        raise HTTPException(404, "Certificado não encontrado")
-
-    cert_path, key_path = criar_arquivos_cert_temp(cert)
-
-    try:
-        sess = criar_sessao(cert_path, key_path)
-
-        r = sess.get(url_extrato, timeout=60)
-        if r.status_code != 200:
-            raise HTTPException(400, "Erro ao abrir extrato")
-
-        html = r.text
-
-        # pega tabela cálculo itens
-        tab, score = _pick_best_table(html, _score_headers_calculo)
-
-        calc = []
-        if tab and score >= 200:
-            calc = _parse_calculo_itens(tab)
-
-        # aqui você deve já ter itens_nota antes
-        itens_nota = []  # <-- usa seu parser existente
-
-        itens_final = _merge_por_item(itens_nota, calc)
-
-        return {
-            "ok": True,
-            "itens": itens_final,
-            "calculo_itens": calc
-        }
-
-    finally:
-        os.remove(cert_path)
-        os.remove(key_path)
-
-
-if __name__ == "__main__":
-    uvicorn.run("extrato_api:app", host="0.0.0.0", port=10000)
-✅ Login: DET -> Portal usando mTLS (cert pem/key do Supabase)
-✅ /extrato-produto:
-  abre extrato.jsp, extrai TOKEN + USUARIO e CHAVE (44 dígitos)
-  monta capa_internamentos e segue até processamentos/show
-  extrai:
-    - "Itens da Nota" (NCM/CFOP/CEST/Produto SEFIN)
-    - "Cálculo Itens" (Val. a Recolher.)
-  mescla por ITEM e retorna JSON completo
+# -*- coding: utf-8 -*-
+"""
+extrato_api.py — FastAPI (Render)
+
+Rotas:
+- /health
+- /empresas?user=...
+- /debitos?user=...&codi=...&incluir_ano_anterior=1
+- /extrato-produto?user=...&codi=...&url_extrato=...&chave=...
+
+Login: DET -> Portal usando mTLS (cert pem/key do Supabase)
+
+Extrato-produto:
+- abre extrato.jsp, extrai TOKEN + USUARIO e CHAVE (44 dígitos)
+- abre internamento (capa_internamentos) e extrai:
+  - "Itens da Nota" (NCM/CFOP/CEST/Produto SEFIN)
+  - "Cálculo Itens" (Val. a Recolher)
+- mescla por ITEM e retorna JSON completo (campos calc_val_*).
 """
 
 from __future__ import annotations
@@ -304,8 +42,11 @@ import uvicorn
 # =========================================================
 # CONFIG
 # =========================================================
-SUPABASE_URL = "https://hysrxadnigzqadnlkynq.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://hysrxadnigzqadnlkynq.supabase.co").strip()
+SUPABASE_KEY = os.getenv(
+    "SUPABASE_KEY",
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"
+).strip()
 TABELA_CERTS = os.getenv("TABELA_CERTS", "certifica_dfe").strip()
 
 DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "1") == "1"
@@ -449,12 +190,14 @@ def empresas(user: str = Query(...)):
         if not codi or codi in seen:
             continue
         seen.add(codi)
-        out.append({
-            "codi": codi,
-            "empresa": (c.get("empresa") or "").strip(),
-            "cnpj": (c.get("cnpj/cpf") or "").strip(),
-            "vencimento": (c.get("vencimento") or ""),
-        })
+        out.append(
+            {
+                "codi": codi,
+                "empresa": (c.get("empresa") or "").strip(),
+                "cnpj": (c.get("cnpj/cpf") or "").strip(),
+                "vencimento": (c.get("vencimento") or ""),
+            }
+        )
     return {"ok": True, "user": user, "total": len(out), "empresas": out}
 
 
@@ -482,14 +225,16 @@ def criar_arquivos_cert_temp(cert_row: Dict[str, Any]) -> Tuple[str, str]:
 def criar_sessao(cert_path: str, key_path: str) -> requests.Session:
     s = requests.Session()
     s.cert = (cert_path, key_path)
-    s.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    })
+    s.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+    )
     return s
 
 
@@ -514,7 +259,7 @@ def abrir_acesso_digital_e_entrar(sess: requests.Session) -> bool:
     if r_ent.status_code != 200:
         return False
 
-    return ("/certificado/acessos" in (r_ent.url or ""))
+    return "/certificado/acessos" in (r_ent.url or "")
 
 
 def _extrair_form_logintoken(html: str) -> Tuple[Optional[str], Optional[Dict[str, str]]]:
@@ -534,7 +279,9 @@ def _extrair_form_logintoken(html: str) -> Tuple[Optional[str], Optional[Dict[st
 
 
 def _extrair_redirect_do_logintoken(html: str) -> Optional[str]:
-    m = re.search(r"location\s*=\s*['\"](https://portalcontribuinte\.sefin\.ro\.gov\.br[^'\"]+)['\"]", html)
+    m = re.search(
+        r"location\s*=\s*['\"](https://portalcontribuinte\.sefin\.ro\.gov\.br[^'\"]+)['\"]", html
+    )
     if m:
         return m.group(1)
     m = re.search(r"location\.href\s*=\s*['\"](/app/home[^'\"]*)['\"]", html)
@@ -556,9 +303,9 @@ def ir_para_portal(sess: requests.Session) -> bool:
         if r_login.status_code == 200 and "LoginToken" in (r_login.url or ""):
             next_url = _extrair_redirect_do_logintoken(r_login.text) or URL_PORTAL_HOME_DEFAULT
             r_home = sess.get(next_url, timeout=30, allow_redirects=True)
-            return (r_home.status_code == 200 and "portalcontribuinte.sefin.ro.gov.br" in (r_home.url or ""))
+            return (r_home.status_code == 200) and ("portalcontribuinte.sefin.ro.gov.br" in (r_home.url or ""))
     r_portal = sess.get(URL_PORTAL_HOME_DEFAULT, timeout=30, allow_redirects=True)
-    return (r_portal.status_code == 200 and "LoginToken" not in (r_portal.url or ""))
+    return (r_portal.status_code == 200) and ("LoginToken" not in (r_portal.url or ""))
 
 
 # =========================================================
@@ -619,18 +366,20 @@ def obter_debitos_inscricao_estadual(html_deb: str) -> List[Dict[str, str]]:
                 return href
             return requests.compat.urljoin(URL_CONSULTA_DEBITOS_LISTA, href)
 
-        debitos.append({
-            "nr_lancamento": txt(2),
-            "parcela": txt(3),
-            "referencia": txt(4),
-            "complemento": txt(5),
-            "receita": txt(6),
-            "situacao": txt(7),
-            "data_vencimento": txt(8),
-            "valor_lancamento": txt(9),
-            "valor_atualizado": txt(10),
-            "url_extrato": norm_url(link_extrato.get("href") if link_extrato else ""),
-        })
+        debitos.append(
+            {
+                "nr_lancamento": txt(2),
+                "parcela": txt(3),
+                "referencia": txt(4),
+                "complemento": txt(5),
+                "receita": txt(6),
+                "situacao": txt(7),
+                "data_vencimento": txt(8),
+                "valor_lancamento": txt(9),
+                "valor_atualizado": txt(10),
+                "url_extrato": norm_url(link_extrato.get("href") if link_extrato else ""),
+            }
+        )
 
     return debitos
 
@@ -764,44 +513,58 @@ def _extract_table_headers(table) -> List[str]:
     return []
 
 
-def _score_headers(headers: List[str]) -> int:
+def _score_headers_itens(headers: List[str]) -> int:
     """Score genérico (itens da nota)."""
     h = " | ".join([x.strip().lower() for x in headers if x]).lower()
     score = 0
     for kw, pts in [
-        ("itens da nota", 60),
-        ("ncm", 50),
-        ("cfop", 30),
-        ("cest", 20),
-        ("produto sefin", 20),
-        ("descricao", 10),
-        ("descr", 10),
-        ("item", 10),
+        ("itens da nota", 80),
+        ("ncm", 60),
+        ("cfop", 40),
+        ("cest", 30),
+        ("produto sefin", 30),
+        ("descrição", 20),
+        ("descricao", 20),
+        ("item", 20),
     ]:
         if kw in h:
             score += pts
     return score
 
 
+def _norm_header(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"\s+", " ", s).strip()
+    s = s.replace("á", "a").replace("à", "a").replace("â", "a").replace("ã", "a")
+    s = s.replace("é", "e").replace("ê", "e")
+    s = s.replace("í", "i")
+    s = s.replace("ó", "o").replace("ô", "o").replace("õ", "o")
+    s = s.replace("ú", "u")
+    s = s.replace(".", "").replace(":", "")
+    return s
+
+
 def _score_headers_calculo(headers: List[str]) -> int:
-    """Score específico (cálculo itens)."""
-    h = " | ".join([x.strip().lower() for x in headers if x]).lower()
+    """
+    Score FORTE para pegar a tabela "Cálculo Itens" (a da sua imagem),
+    e evitar confundir com "Itens do Lançamento".
+    """
+    hn = " | ".join(_norm_header(x) for x in headers if x)
     score = 0
     for kw, pts in [
-        ("cálculo itens", 60),
-        ("calculo itens", 60),
-        ("val. a recolher", 80),
-        ("val a recolher", 80),
-        ("base calc. final", 50),
-        ("base calc final", 50),
-        ("frete fob", 30),
-        ("val. débito mercadoria", 30),
-        ("val. crédito nfe", 25),
-        ("item", 20),
-        ("produto", 15),
-        ("val. mercadoria", 15),
+        ("calculo itens", 120),
+        ("base calc final", 160),
+        ("frete fob", 140),
+        ("% aliq interna", 180),
+        ("val debito mercadoria", 120),
+        ("val credito nfe", 120),
+        ("val credito cte", 120),
+        ("val a recolher", 220),
+        ("item", 40),
+        ("produto", 40),
+        ("val mercadoria", 40),
     ]:
-        if kw in h:
+        if kw in hn:
             score += pts
     return score
 
@@ -816,7 +579,7 @@ def _pick_best_table(html_internamento: str, scorer) -> Tuple[Optional[Any], Dic
     for i, t in enumerate(tables):
         headers = _extract_table_headers(t)
         sc = scorer(headers)
-        diag["scores"].append({"i": i, "score": sc, "headers_sample": headers[:30]})
+        diag["scores"].append({"i": i, "score": sc, "headers_sample": headers[:40]})
         if sc > best_score:
             best_score = sc
             best = t
@@ -833,7 +596,7 @@ def _parse_items_da_nota(table) -> List[Dict[str, Any]]:
 
     header_cells: List[str] = []
     header_tr = None
-    for tr in all_tr[:10]:
+    for tr in all_tr[:12]:
         ths = tr.find_all("th")
         if ths and len(ths) >= 6:
             header_cells = [th.get_text(" ", strip=True) for th in ths]
@@ -845,22 +608,22 @@ def _parse_items_da_nota(table) -> List[Dict[str, Any]]:
         header_cells = [c.get_text(" ", strip=True) for c in cells]
         header_tr = all_tr[0]
 
-    hnorm = [re.sub(r"\s+", " ", (h or "").strip()).lower() for h in header_cells]
+    hnorm = [_norm_header(h) for h in header_cells]
 
     def find_idx(*names: str) -> Optional[int]:
-        for n in names:
-            n = n.lower()
-            for i, h in enumerate(hnorm):
-                if n in h:
+        needles = [_norm_header(n) for n in names]
+        for i, h in enumerate(hnorm):
+            for n in needles:
+                if n and n in h:
                     return i
         return None
 
     idx_item = find_idx("item")
-    idx_desc = find_idx("descr", "descrição")
+    idx_desc = find_idx("descr", "descricao", "descrição")
     idx_cfop = find_idx("cfop")
     idx_cest = find_idx("cest")
     idx_ncm = find_idx("ncm")
-    idx_prod_sefin = find_idx("produto sefin")
+    idx_prod_sefin = find_idx("produto sefin", "produto")
 
     items: List[Dict[str, Any]] = []
     for tr in all_tr:
@@ -871,7 +634,7 @@ def _parse_items_da_nota(table) -> List[Dict[str, Any]]:
             continue
 
         cols = [td.get_text(" ", strip=True) for td in tds]
-        if len(cols) < 6:
+        if len(cols) < 5:
             continue
 
         def get(i: Optional[int]) -> Optional[str]:
@@ -892,8 +655,6 @@ def _parse_items_da_nota(table) -> List[Dict[str, Any]]:
 
         if not (item["item"] and re.fullmatch(r"\d+", item["item"] or "")):
             continue
-        if not (item["descricao"] or item["ncm"] or item["produto_sefin"]):
-            continue
 
         items.append(item)
 
@@ -902,10 +663,9 @@ def _parse_items_da_nota(table) -> List[Dict[str, Any]]:
 
 def _parse_calculo_itens(table) -> List[Dict[str, Any]]:
     """
-    Tabela 'Cálculo Itens' (tem Val. a Recolher.)
-    Headers esperados incluem (exemplo):
-    Item | Produto | Val. Mercadoria | % Redução... | ... | Val. a Recolher.
-    :contentReference[oaicite:1]{index=1}
+    Parser robusto da tabela "Cálculo Itens":
+    - aceita variações de header (ponto, acento, quebra)
+    - encontra "Val. a Recolher" mesmo se vier "Valor a Recolher."
     """
     all_tr = table.find_all("tr")
     if not all_tr:
@@ -913,9 +673,9 @@ def _parse_calculo_itens(table) -> List[Dict[str, Any]]:
 
     header_cells: List[str] = []
     header_tr = None
-    for tr in all_tr[:10]:
+    for tr in all_tr[:12]:
         ths = tr.find_all("th")
-        if ths and len(ths) >= 8:
+        if ths and len(ths) >= 7:  # << antes estava 8; algumas telas variam
             header_cells = [th.get_text(" ", strip=True) for th in ths]
             header_tr = tr
             break
@@ -925,39 +685,44 @@ def _parse_calculo_itens(table) -> List[Dict[str, Any]]:
         header_cells = [c.get_text(" ", strip=True) for c in cells]
         header_tr = all_tr[0]
 
-    # normaliza header
-    hnorm = [re.sub(r"\s+", " ", (h or "").strip()).lower() for h in header_cells]
+    hnorm = [_norm_header(h) for h in header_cells]
 
     def find_idx_any(*needles: str) -> Optional[int]:
-        for needle in needles:
-            n = needle.lower()
-            for i, h in enumerate(hnorm):
-                if n in h:
+        nn = [_norm_header(n) for n in needles]
+        for i, h in enumerate(hnorm):
+            for n in nn:
+                if n and n in h:
                     return i
         return None
 
     idx_item = find_idx_any("item")
     idx_produto = find_idx_any("produto")
-    idx_val_merc = find_idx_any("val. mercadoria", "val mercadoria")
-    idx_red = find_idx_any("% redução", "reducao")
-    idx_bc_merc = find_idx_any("base calc. mercadoria", "base calc mercadoria")
+    idx_val_merc = find_idx_any("val mercadoria", "valor mercadoria")
+    idx_red = find_idx_any("% reducao", "reducao")
+    idx_bc_merc = find_idx_any("base calc mercadoria", "bc mercadoria")
     idx_frete = find_idx_any("frete fob", "frete")
-    idx_bc_frete = find_idx_any("base calc. frete", "base calc frete")
-    idx_bc_final = find_idx_any("base calc. final", "base calc final")
-    idx_aliq_int = find_idx_any("% alíq. interna", "aliq. interna", "alíq. interna")
-    idx_aliq_nfe = find_idx_any("orig. nfe", "orig nfe")
-    idx_aliq_cte = find_idx_any("orig. cte", "orig cte")
-    idx_deb_merc = find_idx_any("débito mercadoria", "debito mercadoria")
-    idx_deb_frete = find_idx_any("débito frete", "debito frete")
-    idx_cred_nfe = find_idx_any("crédito nfe", "credito nfe")
-    idx_cred_cte = find_idx_any("crédito cte", "credito cte")
-    idx_cred_comp = find_idx_any("créd. comple", "cred. comple", "cred comple")
-    idx_recolher = find_idx_any("a recolher", "recolher")
+    idx_bc_frete = find_idx_any("base calc frete", "bc frete")
+    idx_bc_final = find_idx_any("base calc final", "bc final")
+    idx_aliq_int = find_idx_any("% aliq interna", "aliq interna", "aliquota interna")
+
+    idx_aliq_nfe = find_idx_any("orig nfe", "origem nfe")
+    idx_aliq_cte = find_idx_any("orig cte", "origem cte")
+
+    idx_deb_merc = find_idx_any("debito mercadoria", "val debito mercadoria")
+    idx_deb_frete = find_idx_any("debito frete", "val debito frete", "debito frete fob")
+    idx_cred_nfe = find_idx_any("credito nfe", "val credito nfe")
+    idx_cred_cte = find_idx_any("credito cte", "val credito cte")
+    idx_cred_comp = find_idx_any("cred comple", "cred complementar", "credito complementar")
+
+    # recolher: bem permissivo
+    idx_recolher = None
+    for i, h in enumerate(hnorm):
+        if ("a recolher" in h) or ("valor a recolher" in h) or ("val a recolher" in h) or ("recolher" in h):
+            idx_recolher = i
+            break
 
     def safe_get(cols: List[str], i: Optional[int]) -> Optional[str]:
-        if i is None:
-            return None
-        if i < 0 or i >= len(cols):
+        if i is None or i < 0 or i >= len(cols):
             return None
         v = (cols[i] or "").strip()
         return v or None
@@ -1002,11 +767,11 @@ def _parse_calculo_itens(table) -> List[Dict[str, Any]]:
     return out
 
 
-def _merge_itens_com_calculo(itens_nota: List[Dict[str, Any]], calculo: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Mescla pelo campo 'item' (1..n).
-    Ex.: Item 1 -> pega valor_a_recolher etc. :contentReference[oaicite:2]{index=2}
-    """
+def _merge_itens_com_calculo(
+    itens_nota: List[Dict[str, Any]],
+    calculo: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Mescla pelo campo 'item' (1..n)."""
     calc_by_item: Dict[str, Dict[str, Any]] = {}
     for c in calculo or []:
         it = str(c.get("item") or "").strip()
@@ -1019,28 +784,30 @@ def _merge_itens_com_calculo(itens_nota: List[Dict[str, Any]], calculo: List[Dic
         k = str(it.get("item") or "").strip()
         c = calc_by_item.get(k)
         out = dict(it)
+
         if c:
             with_calc += 1
-            out.update({
-                "calc_produto": c.get("produto"),
-                "calc_val_mercadoria": c.get("val_mercadoria"),
-                "calc_perc_reducao_base_calc": c.get("perc_reducao_base_calc"),
-                "calc_base_calc_mercadoria": c.get("base_calc_mercadoria"),
-                "calc_frete_fob_cte": c.get("frete_fob_cte"),
-                "calc_base_calc_frete_fob": c.get("base_calc_frete_fob"),
-                "calc_base_calc_final": c.get("base_calc_final"),
-                "calc_aliq_interna": c.get("aliq_interna"),
-                "calc_aliq_orig_nfe": c.get("aliq_orig_nfe"),
-                "calc_aliq_orig_cte": c.get("aliq_orig_cte"),
-                "calc_val_debito_mercadoria": c.get("val_debito_mercadoria"),
-                "calc_val_debito_frete_fob": c.get("val_debito_frete_fob"),
-                "calc_val_credito_nfe": c.get("val_credito_nfe"),
-                "calc_val_credito_cte": c.get("val_credito_cte"),
-                "calc_val_cred_complementar": c.get("val_cred_complementar"),
-                "calc_valor_a_recolher": c.get("valor_a_recolher"),
-            })
+            out.update(
+                {
+                    "calc_produto": c.get("produto"),
+                    "calc_val_mercadoria": c.get("val_mercadoria"),
+                    "calc_perc_reducao_base_calc": c.get("perc_reducao_base_calc"),
+                    "calc_base_calc_mercadoria": c.get("base_calc_mercadoria"),
+                    "calc_frete_fob_cte": c.get("frete_fob_cte"),
+                    "calc_base_calc_frete_fob": c.get("base_calc_frete_fob"),
+                    "calc_base_calc_final": c.get("base_calc_final"),
+                    "calc_aliq_interna": c.get("aliq_interna"),
+                    "calc_aliq_orig_nfe": c.get("aliq_orig_nfe"),
+                    "calc_aliq_orig_cte": c.get("aliq_orig_cte"),
+                    "calc_val_debito_mercadoria": c.get("val_debito_mercadoria"),
+                    "calc_val_debito_frete_fob": c.get("val_debito_frete_fob"),
+                    "calc_val_credito_nfe": c.get("val_credito_nfe"),
+                    "calc_val_credito_cte": c.get("val_credito_cte"),
+                    "calc_val_cred_complementar": c.get("val_cred_complementar"),
+                    "calc_valor_a_recolher": c.get("valor_a_recolher"),
+                }
+            )
         else:
-            # deixa os campos explícitos como None
             out["calc_valor_a_recolher"] = None
 
         merged.append(out)
@@ -1108,19 +875,19 @@ def extrato_produto(
         html_intern = r2.text
         final_url = r2.url
 
-        # 1) Itens da Nota (NCM/CFOP/CEST/Produto SEFIN)
-        tab_itens, diag_itens = _pick_best_table(html_intern, _score_headers)
+        # 1) Itens da Nota
+        tab_itens, diag_itens = _pick_best_table(html_intern, _score_headers_itens)
         itens_nota: List[Dict[str, Any]] = []
-        if tab_itens and (diag_itens.get("best_score", 0) >= 60):
+        if tab_itens and (diag_itens.get("best_score", 0) >= 80):
             itens_nota = _parse_items_da_nota(tab_itens)
 
-        # 2) Cálculo Itens (Val. a Recolher.)
+        # 2) Cálculo Itens (tabela da imagem)
         tab_calc, diag_calc = _pick_best_table(html_intern, _score_headers_calculo)
         calc_itens: List[Dict[str, Any]] = []
-        if tab_calc and (diag_calc.get("best_score", 0) >= 80):
+        if tab_calc and (diag_calc.get("best_score", 0) >= 220):
             calc_itens = _parse_calculo_itens(tab_calc)
 
-        # 3) Merge
+        # 3) Merge por item
         itens_mesclados, diag_merge = _merge_itens_com_calculo(itens_nota, calc_itens)
 
         return {
@@ -1134,12 +901,8 @@ def extrato_produto(
                 "token_found": bool(token),
                 "usuario": usuario,
                 "chave": chave_alvo,
-
-                # tabelas
-                "itens": itens_mesclados,          # <- JÁ MESCLADO (com calc_*)
-                "calculo_itens": calc_itens,      # <- cálculo puro (debug/conferência)
-
-                # totais/diagnóstico
+                "itens": itens_mesclados,
+                "calculo_itens": calc_itens,
                 "totais": {
                     "qtd_itens": len(itens_mesclados),
                     "itens_sem_ncm": sum(1 for x in itens_mesclados if not x.get("ncm")),
