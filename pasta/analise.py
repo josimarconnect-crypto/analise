@@ -6,6 +6,7 @@ extrato_api.py — FastAPI (Render)
 - /empresas?user=...
 - /debitos?user=...&codi=...&incluir_ano_anterior=1
 - /extrato-produto?user=...&codi=...&url_extrato=...&chave=...
+- /extrato?user=...&codi=...&url_extrato=...&chave=...   (ALIAS compatível)
 
 ✅ Login: DET -> Portal usando mTLS (cert pem/key do Supabase)
 ✅ /extrato-produto:
@@ -39,7 +40,7 @@ import uvicorn
 # =========================================================
 # CONFIG
 # =========================================================
-SUPABASE_URL = "https://hysrxadnigzqadnlkynq.supabase.co"
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://hysrxadnigzqadnlkynq.supabase.co").strip()
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"
 TABELA_CERTS = os.getenv("TABELA_CERTS", "certifica_dfe").strip()
 
@@ -140,7 +141,7 @@ def root():
         "ok": True,
         "service": "extrato_api",
         "date_utc": _now_iso(),
-        "routes": ["/health", "/empresas", "/debitos", "/extrato-produto"],
+        "routes": ["/health", "/empresas", "/debitos", "/extrato-produto", "/extrato"],
         "log_file": LOG_FILE,
     }
 
@@ -416,9 +417,6 @@ def route_debitos(
     codi: str = Query(...),
     incluir_ano_anterior: int = Query(1),
 ):
-    """
-    ✅ Essa é a rota que estava dando 404 no seu deploy.
-    """
     if not user or "@" not in user:
         raise HTTPException(status_code=400, detail="user inválido.")
     if not codi:
@@ -608,7 +606,6 @@ def _parse_items_from_table(table) -> List[Dict[str, Any]]:
             "cols_raw": cols,
         }
 
-        # só aceita se parece linha de item
         if not (item["item"] and re.fullmatch(r"\d+", item["item"] or "")):
             continue
         if not (item["descricao"] or item["ncm"] or item["produto_sefin"]):
@@ -710,6 +707,17 @@ def extrato_produto(
                     os.remove(p)
             except Exception:
                 pass
+
+
+# ✅ ALIAS: mantém compatibilidade com chamadas antigas /extrato
+@app.get("/extrato")
+def extrato_alias(
+    user: str = Query(...),
+    codi: str = Query(...),
+    url_extrato: str = Query(...),
+    chave: str = Query(""),
+):
+    return extrato_produto(user=user, codi=codi, url_extrato=url_extrato, chave=chave)
 
 
 if __name__ == "__main__":
