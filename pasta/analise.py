@@ -438,6 +438,65 @@ def _pick_best_table(
     return (best if best_score >= min_score else None), diag
 
 
+def _localizar_tabela_calculo(soup: BeautifulSoup) -> Tuple[Optional[Tag], str]:
+    """
+    Localiza a tabela de Cálculo Itens com 4 estratégias em cascata.
+
+    O problema real de produção: o lxml às vezes não contabiliza a tabela de
+    cálculo no find_all("table") quando o HTML do servidor tem estrutura
+    ligeiramente diferente (tabela aninhada em div específica, HTML mal-formado,
+    etc.). Por isso o scorer baseado em find_all("table") falha em prod.
+
+    Estratégias (ordem de prioridade):
+      1. div#calculo-itens-container  → busca pelo id fixo do container
+      2. tr.itens-calculos-row        → busca pela classe fixa dos TRs de dados
+      3. heading "Cálculo Itens"      → navega pelos parents ou usa find_next
+      4. scorer de headers             → último recurso, varre todas as tabelas
+    """
+    # ── 1. ID direto do container ──────────────────────────────────────────
+    container = soup.find("div", {"id": "calculo-itens-container"})
+    if container:
+        table = container.find("table")
+        if table:
+            return table, "id:calculo-itens-container"
+
+    # ── 2. Classe nos TRs de dados ─────────────────────────────────────────
+    rows = soup.find_all("tr", class_="itens-calculos-row")
+    if rows:
+        table = rows[0].find_parent("table")
+        if table:
+            return table, "class:itens-calculos-row"
+
+    # ── 3. Heading "Cálculo Itens" ─────────────────────────────────────────
+    for heading in soup.find_all(["h1", "h2", "h3", "h4", "h5"]):
+        txt = _norm_text(heading.get_text())
+        if "calculo itens" in txt or "calculo de itens" in txt:
+            # Tentar via parents (do mais próximo ao mais distante)
+            for parent in heading.parents:
+                if parent.name in ("div", "section", "article"):
+                    t = parent.find("table")
+                    if t:
+                        return t, "heading:parent"
+            # Fallback: próxima tabela no DOM
+            t = heading.find_next("table")
+            if t:
+                return t, "heading:next"
+
+    # ── 4. Scorer de headers (último recurso) ──────────────────────────────
+    tables = soup.find_all("table")
+    best: Optional[Tag] = None
+    best_score = -1
+    for t in tables:
+        sc = _score_table(t, _SCORE_CALC_KW, bonus_if_n_headers=17)
+        if sc > best_score:
+            best_score = sc
+            best = t
+    if best and best_score >= 100:   # threshold alto para evitar falso positivo
+        return best, f"scorer:score={best_score}"
+
+    return None, "nao_encontrada"
+
+
 # ── Parse: Itens da Nota (dinâmico) ───────────────────────────────
 
 def _find_col_idx(norm_headers: List[str], *aliases: str) -> Optional[int]:
@@ -775,14 +834,16 @@ def parse_internamento(html_intern: str) -> Dict[str, Any]:
     for it in itens_nota:
         it.pop("_n_cols", None)
 
-    # Tabela 2: Cálculo Itens
-    tab_calc, diag_sel_calc = _pick_best_table(
-        soup, _SCORE_CALC_KW, min_score=50, bonus_if_n_headers=17
-    )
+    # Tabela 2: Cálculo Itens — 4 estratégias em cascata
+    # Necessário pois em produção o lxml às vezes não conta a tabela de cálculo
+    # no find_all("table") (HTML do servidor ligeiramente diferente do local).
+    tab_calc, estrategia_calc = _localizar_tabela_calculo(soup)
     calc_itens: List[Dict[str, Any]] = []
-    diag_parse_calc: Dict[str, Any] = {}
+    diag_parse_calc: Dict[str, Any] = {"estrategia": estrategia_calc}
     if tab_calc:
-        calc_itens, diag_parse_calc = _parse_calculo_itens(tab_calc)
+        _linhas, _d = _parse_calculo_itens(tab_calc)
+        calc_itens = _linhas
+        diag_parse_calc.update(_d)
     for c in calc_itens:
         c.pop("_n_cols", None)
 
@@ -802,7 +863,7 @@ def parse_internamento(html_intern: str) -> Dict[str, Any]:
         },
         "diagnostico": {
             "itens_da_nota": {**diag_sel_itens, "parse": diag_parse_itens},
-            "calculo_itens": {**diag_sel_calc,  "parse": diag_parse_calc},
+            "calculo_itens": diag_parse_calc,
             "merge":         diag_merge,
         },
     }
