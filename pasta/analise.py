@@ -1,22 +1,35 @@
 # -*- coding: utf-8 -*-
 """
 extrato_api.py (FastAPI) — Render
-- /empresas  -> lista empresas (certificados) do Supabase por user
-- /debitos   -> loga DET/Portal via mTLS e retorna débitos (com url_extrato/url_dare)
-- /extrato   -> abre extrato.jsp e retorna JSON por produto (com NCM)
+✅ CORREÇÃO: mescla ("merge") entre:
+  - Tabela "Itens da nota"  -> contém NCM (coluna NCM)
+  - Tabela "Cálculo Itens"  -> contém cálculo/impostos por item (e Produto 8231 etc)
+MERGE padrão: por "Item" (mais estável).
 
-Requisitos:
-  pip install fastapi uvicorn requests beautifulsoup4 lxml
-
-Start Command (Render):
-  PYTHONPATH=. uvicorn extrato_api:app --host 0.0.0.0 --port $PORT
+Rotas:
+  GET /empresas?user=...
+  GET /debitos?user=...&codi=...&incluir_ano_anterior=1
+  GET /extrato?user=...&codi=...&url_extrato=...
 
 ENV (Render):
   SUPABASE_URL
   SUPABASE_KEY
   TABELA_CERTS=certifica_dfe (opcional)
   DEBUG_ERRORS=1 (opcional)
+  LOG_FILE=/tmp/extrato_api.log (opcional)
+
+Start Command:
+  PYTHONPATH=. uvicorn extrato_api:app --host 0.0.0.0 --port $PORT
+
+requirements.txt:
+  fastapi==0.115.6
+  uvicorn==0.30.6
+  requests==2.32.3
+  beautifulsoup4==4.12.3
+  lxml==5.2.2
 """
+
+from __future__ import annotations
 
 import os
 import re
@@ -41,8 +54,8 @@ import uvicorn
 # =========================================================
 # CONFIG
 # =========================================================
-SUPABASE_URL = "https://hysrxadnigzqadnlkynq.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
 TABELA_CERTS = os.getenv("TABELA_CERTS", "certifica_dfe").strip()
 
 DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "1") == "1"
@@ -474,7 +487,6 @@ def debitos(
             if debs:
                 all_debs.extend(debs)
 
-        # ordena por vencimento texto (mantém como vem)
         logger.info("DEBITOS_DONE | user=%s | codi=%s | debitos=%s | erros=%s", user, codi_sel, len(all_debs), len(erros))
 
         return {
@@ -503,196 +515,239 @@ def debitos(
 
 
 # =========================================================
-# PARSER EXTRATO (PRODUTOS + NCM + IMPOSTOS)
+# ✅ EXTRATO: ITENS (com NCM) + CÁLCULO (impostos) + MERGE
 # =========================================================
-def _norm(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"\s+", " ", s)
-    s = (
-        s.replace("á", "a").replace("à", "a").replace("ã", "a").replace("â", "a")
-         .replace("é", "e").replace("ê", "e")
-         .replace("í", "i")
-         .replace("ó", "o").replace("ô", "o").replace("õ", "o")
-         .replace("ú", "u")
-         .replace("ç", "c")
-    )
-    return s
+def _norm_txt(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
 
 
-def _parse_num_br(s: str) -> Optional[float]:
+def _to_number_ptbr(s: str) -> Optional[float]:
+    """
+    Converte '5.633,65' -> 5633.65
+    Retorna None se vazio.
+    """
+    s = _norm_txt(s)
     if not s:
         return None
-    t = re.sub(r"[^\d,.\-]", "", (s or "").strip())
+    t = re.sub(r"[^\d,.\-]", "", s)
     if not t:
         return None
-    if "," in t:
-        t = t.replace(".", "").replace(",", ".")
+    t = t.replace(".", "").replace(",", ".")
     try:
         return float(t)
     except Exception:
         return None
 
 
-def _table_headers_and_rows(table) -> Tuple[List[str], List[List[str]]]:
-    ths = table.find_all("th")
-    headers = [_norm(th.get_text(" ", strip=True)) for th in ths]
-    headers = [h for h in headers if h]
+def _find_table_by_title(soup: BeautifulSoup, title_text: str):
+    """
+    Procura um <h4 class="table-title">TÍTULO</h4> e pega a primeira <table> dentro do mesmo bloco.
+    Seu HTML tem exatamente esse padrão.
+    """
+    title_text_n = _norm_txt(title_text).lower()
+    h4 = None
+    for x in soup.find_all(["h3", "h4"]):
+        if _norm_txt(x.get_text()).lower() == title_text_n:
+            h4 = x
+            break
+    if not h4:
+        return None
 
-    rows: List[List[str]] = []
-    for tr in table.find_all("tr"):
+    parent = h4.find_parent()
+    if parent:
+        tb = parent.find("table")
+        if tb:
+            return tb
+
+    return h4.find_next("table")
+
+
+def _table_headers(table) -> List[str]:
+    thead = table.find("thead")
+    if not thead:
+        # fallback: usa a primeira row como header se tiver <th>
+        ths = table.find_all("th")
+        return [_norm_txt(th.get_text()) for th in ths if _norm_txt(th.get_text())]
+    ths = thead.find_all("th")
+    return [_norm_txt(th.get_text()) for th in ths if _norm_txt(th.get_text())]
+
+
+def _table_rows(table) -> List[List[str]]:
+    tbody = table.find("tbody")
+    trs = tbody.find_all("tr") if tbody else table.find_all("tr")
+    out = []
+    for tr in trs:
         tds = tr.find_all("td")
         if not tds:
             continue
-        cols = [td.get_text(" ", strip=True) for td in tds]
-        if any(c.strip() for c in cols):
-            rows.append(cols)
-
-    return headers, rows
-
-
-def _score(headers: List[str], kind: str) -> int:
-    H = " | ".join(headers)
-    score = 0
-    if kind == "prod":
-        keys = [
-            ("produto", 6), ("descricao", 4), ("item", 2),
-            ("codigo", 4), ("cod", 2),
-            ("ncm", 10),
-            ("cfop", 5),
-            ("qtd", 3), ("quant", 3),
-            ("un", 2), ("unid", 2),
-            ("valor", 2), ("unit", 2), ("total", 2),
-        ]
-    else:
-        keys = [
-            ("icms", 8), ("base", 6), ("aliquota", 6),
-            ("multa", 3), ("juros", 3),
-            ("principal", 3), ("atualizado", 3),
-            ("total", 2), ("tribut", 2),
-        ]
-    for k, w in keys:
-        if k in H:
-            score += w
-    return score
-
-
-def _map_prod_row(headers: List[str], cols: List[str]) -> Dict[str, Any]:
-    if len(cols) < len(headers):
-        cols = cols + [""] * (len(headers) - len(cols))
-    if len(cols) > len(headers):
-        cols = cols[: len(headers)]
-    raw = {headers[i]: (cols[i] or "").strip() for i in range(len(headers))}
-
-    def pick_contains(*needles: str) -> Optional[str]:
-        for n in needles:
-            for k, v in raw.items():
-                if n in k and v:
-                    return v
-        return None
-
-    codigo = pick_contains("codigo", "cod")
-    desc = pick_contains("descricao", "produto")
-    ncm = pick_contains("ncm")  # ✅ chave obrigatória no retorno (mesmo que None)
-    cfop = pick_contains("cfop")
-    und = pick_contains("unid", "un")
-    qtd = pick_contains("qtd", "quant")
-    v_unit = pick_contains("unit")
-
-    v_total = None
-    for k, v in raw.items():
-        kn = _norm(k)
-        if ("valor" in kn and "total" in kn) or kn in ("total", "v total", "valor total"):
-            if v:
-                v_total = v
-                break
-
-    return {
-        "codigo_produto": codigo,
-        "descricao": desc,
-        "ncm": ncm or None,
-        "cfop": cfop,
-        "unidade": und,
-        "quantidade": _parse_num_br(qtd) if qtd else None,
-        "valor_unitario": _parse_num_br(v_unit) if v_unit else None,
-        "valor_total": _parse_num_br(v_total) if v_total else None,
-        "campos_raw": raw,
-    }
-
-
-def _map_generic_rows(headers: List[str], rows: List[List[str]]) -> List[Dict[str, str]]:
-    out = []
-    for cols in rows:
-        if len(cols) < len(headers):
-            cols = cols + [""] * (len(headers) - len(cols))
-        if len(cols) > len(headers):
-            cols = cols[: len(headers)]
-        out.append({headers[i]: (cols[i] or "").strip() for i in range(len(headers))})
+        cols = [_norm_txt(td.get_text(" ", strip=True)) for td in tds]
+        if any(c for c in cols):
+            out.append(cols)
     return out
 
 
-def extrair_extrato_nfe_json(html: str) -> Dict[str, Any]:
+def parse_itens_da_nota(html: str) -> List[Dict[str, Any]]:
+    """
+    ✅ Aqui é onde vem o NCM.
+    Seu arquivo tem coluna NCM visível em 'Itens da nota'.
+    """
     soup = BeautifulSoup(html, "lxml")
-    tables = soup.find_all("table")
+    table = _find_table_by_title(soup, "Itens da nota")
+    if not table:
+        return []
 
-    best_prod_score = 0
-    best_imp_score = 0
-    best_prod_headers: List[str] = []
-    best_imp_headers: List[str] = []
-    best_prod_rows: List[List[str]] = []
-    best_imp_rows: List[List[str]] = []
+    headers = _table_headers(table)
+    rows = _table_rows(table)
 
-    for tb in tables:
-        headers, rows = _table_headers_and_rows(tb)
-        if not headers or not rows:
+    # Mapeia índices pelo nome do header (mais robusto que posição fixa)
+    def idx_of(name_contains: str) -> Optional[int]:
+        for i, h in enumerate(headers):
+            if name_contains.lower() in h.lower():
+                return i
+        return None
+
+    i_item = idx_of("Item") or 0
+    i_desc = idx_of("Descrição") or 1
+    i_cfop = idx_of("CFOP")
+    i_cest = idx_of("CEST")
+    i_ncm = idx_of("NCM")
+
+    itens: List[Dict[str, Any]] = []
+    for cols in rows:
+        # garante tamanho
+        if len(cols) < len(headers):
+            cols = cols + [""] * (len(headers) - len(cols))
+
+        item = cols[i_item].strip() if i_item is not None and i_item < len(cols) else ""
+        desc = cols[i_desc].strip() if i_desc is not None and i_desc < len(cols) else ""
+        cfop = cols[i_cfop].strip() if i_cfop is not None and i_cfop < len(cols) else ""
+        cest = cols[i_cest].strip() if i_cest is not None and i_cest < len(cols) else ""
+        ncm = cols[i_ncm].strip() if i_ncm is not None and i_ncm < len(cols) else ""
+
+        if not (item or desc or ncm):
             continue
-        sp = _score(headers, "prod")
-        si = _score(headers, "imp")
 
-        if sp > best_prod_score:
-            best_prod_score = sp
-            best_prod_headers = headers
-            best_prod_rows = rows
+        itens.append({
+            "item": item,
+            "descricao": desc,
+            "cfop": cfop or None,
+            "cest": cest or None,
+            "ncm": ncm or None,  # ✅ GARANTIDO no retorno
+            "campos_raw": {headers[i]: cols[i] for i in range(min(len(headers), len(cols)))},
+        })
 
-        if si > best_imp_score:
-            best_imp_score = si
-            best_imp_headers = headers
-            best_imp_rows = rows
+    return itens
 
-    produtos: List[Dict[str, Any]] = []
-    impostos: List[Dict[str, str]] = []
-    totais: Dict[str, Any] = {}
 
-    if best_prod_score >= 10:
-        for cols in best_prod_rows:
-            prod = _map_prod_row(best_prod_headers, cols)
-            if prod.get("codigo_produto") or prod.get("descricao") or prod.get("ncm"):
-                produtos.append(prod)
+def parse_calculo_itens(html: str) -> List[Dict[str, Any]]:
+    """
+    Tabela 'Cálculo Itens' (impostos).
+    """
+    soup = BeautifulSoup(html, "lxml")
+    table = _find_table_by_title(soup, "Cálculo Itens")
+    if not table:
+        return []
 
-        soma_vt = 0.0
-        count_vt = 0
-        for p in produtos:
-            vt = p.get("valor_total")
-            if isinstance(vt, (int, float)):
-                soma_vt += float(vt)
-                count_vt += 1
-        totais["produtos_total_valor_total_somado"] = round(soma_vt, 2) if count_vt else None
-        totais["produtos_qtd_com_valor_total"] = count_vt
-        totais["produtos_sem_ncm"] = sum(1 for p in produtos if not p.get("ncm"))
+    headers = _table_headers(table)
+    rows = _table_rows(table)
 
-    if best_imp_score >= 10:
-        impostos = _map_generic_rows(best_imp_headers, best_imp_rows)
+    # Aqui usamos posição fixa porque seu cálculo tem muitas colunas e nomes podem variar,
+    # mas ainda guardamos campos_raw.
+    out: List[Dict[str, Any]] = []
+    for cols in rows:
+        if len(cols) < 2:
+            continue
+        # completa
+        if len(cols) < len(headers):
+            cols = cols + [""] * (len(headers) - len(cols))
+
+        def txt(i: int) -> str:
+            return cols[i].strip() if i < len(cols) else ""
+
+        def num(i: int) -> Optional[float]:
+            return _to_number_ptbr(txt(i))
+
+        item = txt(0)
+        if not item:
+            continue
+
+        out.append({
+            "item": item,
+            "produto_sefin": txt(1) or None,  # ex: 8231
+            "val_mercadoria": num(2),
+            "perc_reducao_bc": num(3),
+            "bc_mercadoria": num(4),
+            "frete_fob_cte": num(5),
+            "bc_frete_fob": num(6),
+            "bc_final": num(7),
+            "aliq_interna": num(8),
+            "aliq_orig_nfe": num(9),
+            "aliq_orig_cte": num(10),
+            "debito_mercadoria": num(11),
+            "debito_frete_fob": num(12),
+            "credito_nfe": num(13),
+            "credito_cte": num(14),
+            "credito_complementar": num(15),
+            "valor_a_recolher": num(16),
+            "campos_raw": {headers[i]: cols[i] for i in range(min(len(headers), len(cols)))},
+        })
+
+    return out
+
+
+def merge_itens_e_calculo(itens: List[Dict[str, Any]], calculos: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    ✅ MERGE POR ITEM: itens da nota (com NCM) + cálculo itens (imposto)
+    """
+    calc_by_item: Dict[str, Dict[str, Any]] = {}
+    for c in calculos:
+        k = str(c.get("item") or "").strip()
+        if not k:
+            continue
+        # se vier duplicado, mantém o primeiro (ou troque a lógica se precisar)
+        if k not in calc_by_item:
+            calc_by_item[k] = c
+
+    merged: List[Dict[str, Any]] = []
+    for it in itens:
+        k = str(it.get("item") or "").strip()
+        c = calc_by_item.get(k)
+        merged.append({
+            **it,
+            "produto_sefin": c.get("produto_sefin") if c else None,
+            "calculo": c or None,
+        })
+
+    total_recolher = 0.0
+    for m in merged:
+        v = (m.get("calculo") or {}).get("valor_a_recolher")
+        if isinstance(v, (int, float)):
+            total_recolher += float(v)
+
+    return {
+        "itens_mesclados": merged,
+        "totais": {
+            "qtd_itens": len(merged),
+            "itens_sem_ncm": sum(1 for x in merged if not x.get("ncm")),
+            "total_valor_a_recolher": round(total_recolher, 2),
+        }
+    }
+
+
+def extrair_extrato_mesclado(html: str) -> Dict[str, Any]:
+    itens = parse_itens_da_nota(html)
+    calc = parse_calculo_itens(html)
+    merged = merge_itens_e_calculo(itens, calc)
 
     return {
         "ok": True,
-        "produtos": produtos,
-        "impostos": impostos,
-        "totais": totais,
+        "itens_da_nota": itens,
+        "calculo_itens": calc,
+        "merge": merged,
         "meta": {
-            "tabela_produtos_score": best_prod_score,
-            "tabela_impostos_score": best_imp_score,
-            "produtos_headers": best_prod_headers[:50],
-            "impostos_headers": best_imp_headers[:50],
-        },
+            "qtd_itens": len(itens),
+            "qtd_calculos": len(calc),
+        }
     }
 
 
@@ -740,9 +795,16 @@ def route_extrato(
             raise HTTPException(status_code=401, detail="Falha ao abrir Portal (LoginToken/home).")
 
         html = baixar_extrato(sess, url_extrato)
-        data = extrair_extrato_nfe_json(html)
 
-        logger.info("EXTRATO_DONE | user=%s | codi=%s | produtos=%s", user, codi_sel, len(data.get("produtos") or []))
+        # ✅ AQUI está a correção: extrai NCM de Itens da nota e faz merge com Cálculo
+        data = extrair_extrato_mesclado(html)
+
+        logger.info(
+            "EXTRATO_DONE | user=%s | codi=%s | itens=%s | sem_ncm=%s",
+            user, codi_sel,
+            data.get("merge", {}).get("totais", {}).get("qtd_itens", 0),
+            data.get("merge", {}).get("totais", {}).get("itens_sem_ncm", 0),
+        )
 
         return {"ok": True, "user": user, "codi": codi_sel, "empresa": empresa, "result": data}
 
