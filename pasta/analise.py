@@ -1,12 +1,275 @@
-# -*- coding: utf-8 -*-
-"""
-extrato_api.py — FastAPI (Render)
-✅ Rotas:
-- /health
-- /empresas?user=...
-- /debitos?user=...&codi=...&incluir_ano_anterior=1
-- /extrato-produto?user=...&codi=...&url_extrato=...&chave=...
+from __future__ import annotations
 
+import os
+import re
+import base64
+import tempfile
+import traceback
+import logging
+from logging.handlers import RotatingFileHandler
+from datetime import date, datetime, timezone
+from typing import Dict, Any, Optional, List, Tuple
+
+import requests
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, Query, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import uvicorn
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+SUPABASE_URL = "https://hysrxadnigzqadnlkynq.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"
+TABELA_CERTS = os.getenv("TABELA_CERTS", "certifica_dfe").strip()
+
+DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "1") == "1"
+LOG_FILE = os.getenv("LOG_FILE", "/tmp/extrato_api.log")
+
+URL_DET_HOME = "https://detsec.sefin.ro.gov.br/certificados"
+URL_ENTRAR = "https://detsec.sefin.ro.gov.br/entrar"
+URL_REDIRECT_PORTAL = "https://detsec.sefin.ro.gov.br/contribuinte/notificacoes/redirect_portal"
+URL_PORTAL_HOME_DEFAULT = "https://portalcontribuinte.sefin.ro.gov.br/app/home/?exibir_modal=true"
+
+BASE_INTERNAMENTO = "https://internamentonotas.sefin.ro.gov.br"
+
+
+# =========================================================
+# LOG
+# =========================================================
+logger = logging.getLogger("extrato_api")
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    fh = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    logger.addHandler(fh)
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def supabase_headers():
+    return {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+
+
+# =========================================================
+# APP
+# =========================================================
+app = FastAPI(title="API Débitos + Extrato por Produto — SEFIN RO")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=".*",
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# =========================================================
+# CERTIFICADO
+# =========================================================
+def criar_arquivos_cert_temp(cert_row):
+    pem = base64.b64decode(cert_row["pem"])
+    key = base64.b64decode(cert_row["key"])
+
+    cert_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pem")
+    key_file = tempfile.NamedTemporaryFile(delete=False, suffix=".key")
+
+    cert_file.write(pem)
+    key_file.write(key)
+
+    cert_file.close()
+    key_file.close()
+
+    return cert_file.name, key_file.name
+
+
+def criar_sessao(cert_path, key_path):
+    s = requests.Session()
+    s.cert = (cert_path, key_path)
+    s.headers.update({"User-Agent": "Mozilla/5.0"})
+    return s
+
+
+# =========================================================
+# SCORE CÁLCULO ITENS (CORRIGIDO)
+# =========================================================
+def _score_headers_calculo(headers: List[str]) -> int:
+    h = " | ".join([re.sub(r"\s+", " ", x).lower() for x in headers])
+
+    score = 0
+    for kw, pts in [
+        ("% alíq. interna", 150),
+        ("frete fob", 120),
+        ("base calc. final", 150),
+        ("val. crédito nfe", 100),
+        ("val. débito mercadoria", 100),
+        ("val. a recolher", 200),
+        ("val a recolher", 200),
+        ("item", 20),
+        ("produto", 20),
+    ]:
+        if kw in h:
+            score += pts
+
+    return score
+
+
+# =========================================================
+# PICK TABELA
+# =========================================================
+def _extract_table_headers(table):
+    ths = table.find_all("th")
+    return [th.get_text(" ", strip=True) for th in ths]
+
+
+def _pick_best_table(html, scorer):
+    soup = BeautifulSoup(html, "lxml")
+    tables = soup.find_all("table")
+
+    best = None
+    best_score = -1
+
+    for t in tables:
+        headers = _extract_table_headers(t)
+        sc = scorer(headers)
+        if sc > best_score:
+            best_score = sc
+            best = t
+
+    return best, best_score
+
+
+# =========================================================
+# PARSE CÁLCULO ITENS
+# =========================================================
+def _parse_calculo_itens(table):
+    rows = table.find_all("tr")
+
+    header = [th.get_text(" ", strip=True).lower() for th in rows[0].find_all("th")]
+
+    def idx(name):
+        for i, h in enumerate(header):
+            if name in h:
+                return i
+        return None
+
+    idx_item = idx("item")
+    idx_recolher = idx("recolher")
+    idx_base_final = idx("base calc. final")
+    idx_aliq = idx("interna")
+    idx_val_merc = idx("mercadoria")
+
+    out = []
+
+    for tr in rows[1:]:
+        cols = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+        if not cols:
+            continue
+
+        item = cols[idx_item] if idx_item is not None else None
+        if not item or not item.isdigit():
+            continue
+
+        out.append({
+            "item": item,
+            "base_calc_final": cols[idx_base_final] if idx_base_final is not None else None,
+            "aliq_interna": cols[idx_aliq] if idx_aliq is not None else None,
+            "val_mercadoria": cols[idx_val_merc] if idx_val_merc is not None else None,
+            "valor_a_recolher": cols[idx_recolher] if idx_recolher is not None else None,
+        })
+
+    return out
+
+
+# =========================================================
+# MERGE
+# =========================================================
+def _merge_por_item(itens_nota, calc):
+    calc_map = {c["item"]: c for c in calc}
+
+    merged = []
+
+    for it in itens_nota:
+        item_id = it.get("item")
+        c = calc_map.get(item_id)
+
+        new = dict(it)
+
+        if c:
+            new["calc_base_calc_final"] = c.get("base_calc_final")
+            new["calc_aliq_interna"] = c.get("aliq_interna")
+            new["calc_val_mercadoria"] = c.get("val_mercadoria")
+            new["calc_valor_a_recolher"] = c.get("valor_a_recolher")
+        else:
+            new["calc_valor_a_recolher"] = None
+
+        merged.append(new)
+
+    return merged
+
+
+# =========================================================
+# ROTA EXTRATO PRODUTO
+# =========================================================
+@app.get("/extrato-produto")
+def extrato_produto(
+    user: str = Query(...),
+    codi: str = Query(...),
+    url_extrato: str = Query(...),
+):
+
+    certs = requests.get(
+        f"{SUPABASE_URL}/rest/v1/{TABELA_CERTS}",
+        headers=supabase_headers(),
+        params={"user": f"eq.{user}"}
+    ).json()
+
+    cert = next((c for c in certs if str(c.get("codi")) == codi), None)
+    if not cert:
+        raise HTTPException(404, "Certificado não encontrado")
+
+    cert_path, key_path = criar_arquivos_cert_temp(cert)
+
+    try:
+        sess = criar_sessao(cert_path, key_path)
+
+        r = sess.get(url_extrato, timeout=60)
+        if r.status_code != 200:
+            raise HTTPException(400, "Erro ao abrir extrato")
+
+        html = r.text
+
+        # pega tabela cálculo itens
+        tab, score = _pick_best_table(html, _score_headers_calculo)
+
+        calc = []
+        if tab and score >= 200:
+            calc = _parse_calculo_itens(tab)
+
+        # aqui você deve já ter itens_nota antes
+        itens_nota = []  # <-- usa seu parser existente
+
+        itens_final = _merge_por_item(itens_nota, calc)
+
+        return {
+            "ok": True,
+            "itens": itens_final,
+            "calculo_itens": calc
+        }
+
+    finally:
+        os.remove(cert_path)
+        os.remove(key_path)
+
+
+if __name__ == "__main__":
+    uvicorn.run("extrato_api:app", host="0.0.0.0", port=10000)
 ✅ Login: DET -> Portal usando mTLS (cert pem/key do Supabase)
 ✅ /extrato-produto:
   abre extrato.jsp, extrai TOKEN + USUARIO e CHAVE (44 dígitos)
