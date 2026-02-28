@@ -1,20 +1,23 @@
 # -*- coding: utf-8 -*-
 """
 extrato_api.py — FastAPI (Render)
+
 ✅ Rotas:
 - /health
 - /empresas?user=...
 - /debitos?user=...&codi=...&incluir_ano_anterior=1
 - /extrato-produto?user=...&codi=...&url_extrato=...&chave=...
+- /extrato (alias compatível) -> mesma coisa que /extrato-produto
 
 ✅ Login: DET -> Portal usando mTLS (cert pem/key do Supabase)
+
 ✅ /extrato-produto:
   abre extrato.jsp, extrai TOKEN + USUARIO e CHAVE (44 dígitos)
-  abre internamento (capa_internamentos -> processamentos/show)
+  abre processamentos/show (internamento)
   extrai:
-   - "Itens da Nota" (NCM/CFOP/CEST/Produto SEFIN)
-   - "Cálculo Itens" (Val. a Recolher por Item)
-  mescla por Item (e Produto quando existir)
+    - "Itens da nota" (NCM/CFOP/CEST/Produto SEFIN etc.)
+    - "Cálculo Itens" (Val. Mercadoria, Débito, Créditos, Val. a Recolher...)
+  mescla por Item e devolve JSON completo
 """
 
 from __future__ import annotations
@@ -73,6 +76,13 @@ if not logger.handlers:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _log_exc(prefix: str, exc: Exception):
+    try:
+        logger.error("%s | %s\n%s", prefix, str(exc), traceback.format_exc())
+    except Exception:
+        pass
 
 
 def _require_supabase():
@@ -135,7 +145,7 @@ def root():
         "ok": True,
         "service": "extrato_api",
         "date_utc": _now_iso(),
-        "routes": ["/health", "/empresas", "/debitos", "/extrato-produto"],
+        "routes": ["/health", "/empresas", "/debitos", "/extrato-produto", "/extrato"],
         "log_file": LOG_FILE,
     }
 
@@ -486,7 +496,7 @@ def _montar_url_capa_internamento(usuario: str, chave: str, token: Optional[str]
 
 
 # =========================================================
-# INTERNAMENTO -> PARSE TABLE HELPERS
+# INTERNAMENTO -> ITENS DA NOTA (NCM) + CÁLCULO ITENS
 # =========================================================
 def _extract_table_headers(table) -> List[str]:
     ths = table.find_all("th")
@@ -610,212 +620,174 @@ def _parse_items_from_table(table) -> List[Dict[str, Any]]:
     return items
 
 
-# =========================================================
-# NOVO: PARSE "Cálculo Itens"
-# =========================================================
-def _find_calculo_itens_table(html_internamento: str) -> Tuple[Optional[Any], Dict[str, Any]]:
+def _find_table_by_title(html_internamento: str, title_substr: str) -> Optional[Any]:
+    """
+    Acha o <h4> com texto contendo title_substr e pega a próxima <table>.
+    No HTML do internamento, "Cálculo Itens" aparece assim:
+      <h4 class="table-title"> Cálculo Itens</h4>
+      ... <table>...</table>
+    """
     soup = BeautifulSoup(html_internamento, "lxml")
+    title_substr_norm = (title_substr or "").strip().lower()
 
-    diag: Dict[str, Any] = {"found_by": None}
-
-    container = soup.find(id="calculo-itens-container")
-    if container:
-        t = container.find("table")
-        if t:
-            diag["found_by"] = "id=calculo-itens-container"
-            return t, diag
-
-    # fallback: busca pelo título "Cálculo Itens" e pega a próxima tabela
-    h4s = soup.find_all(["h3", "h4", "h5"])
-    for h in h4s:
-        title = h.get_text(" ", strip=True).lower()
-        if "cálculo itens" in title or "calculo itens" in title:
-            # procurar table depois do h
-            nxt = h.find_parent()
-            if nxt:
-                t = nxt.find("table")
-                if t:
-                    diag["found_by"] = "title+parent"
-                    return t, diag
-            # busca genérica depois do h
-            t = h.find_next("table")
-            if t:
-                diag["found_by"] = "title+next"
-                return t, diag
-
-    return None, diag
+    for h4 in soup.find_all(["h4", "h3", "h5"]):
+        txt = h4.get_text(" ", strip=True).lower()
+        if title_substr_norm in txt:
+            tb = h4.find_next("table")
+            return tb
+    return None
 
 
-def _parse_calculo_itens(table) -> List[Dict[str, Any]]:
+def _parse_generic_table(table) -> Tuple[List[str], List[List[str]]]:
+    if not table:
+        return [], []
+
+    thead = table.find("thead")
+    headers: List[str] = []
+    if thead:
+        trh = thead.find("tr")
+        if trh:
+            headers = [th.get_text(" ", strip=True) for th in trh.find_all(["th", "td"])]
+
+    if not headers:
+        tr0 = table.find("tr")
+        if tr0:
+            headers = [c.get_text(" ", strip=True) for c in tr0.find_all(["th", "td"])]
+
+    rows: List[List[str]] = []
+    tbody = table.find("tbody")
+    trs = (tbody.find_all("tr") if tbody else table.find_all("tr"))
+    for tr in trs:
+        # pula header repetido
+        if tr.find("th"):
+            continue
+        tds = tr.find_all(["td"])
+        if not tds:
+            continue
+        rows.append([td.get_text(" ", strip=True) for td in tds])
+
+    return headers, rows
+
+
+def _parse_calculo_itens_table(table) -> List[Dict[str, Any]]:
     """
-    Tabela esperada (colunas):
-      Item, Produto, Val. Mercadoria, % Redução Base Calc., Base Calc. Mercadoria,
-      Frete FOB (CTE), Base Calc. Frete-FOB, Base Calc. Final,
-      % Alíq. Interna, %Alíq. Orig. NFE, %Alíq. Orig. CTE,
-      Val. Débito Mercadoria, Val. Débito Frete-FOB,
-      Val. Crédito NFE, Val. Crédito CTE, Val. Créd. Comple., Val. a Recolher.
+    Esperado (exemplo):
+    Item | Produto | Val. Mercadoria | % Redução Base Calc. | Base Calc. Mercadoria | Frete FOB (CTE) |
+    Base Calc. Frete-FOB | Base Calc. Final | % Alíq. Interna | %Alíq. Orig. NFE | %Alíq. Orig. CTE |
+    Val. Débito Mercadoria | Val. Débito Frete-FOB | Val. Crédito NFE | Val. Crédito CTE | Val. Créd. Comple. | Val. a Recolher
     """
-    all_tr = table.find_all("tr")
-    if not all_tr:
-        return []
+    headers, rows = _parse_generic_table(table)
+    hnorm = [re.sub(r"\s+", " ", (h or "").strip()).lower() for h in headers]
 
-    # header
-    header_tr = None
-    header_cells: List[str] = []
-    for tr in all_tr[:10]:
-        ths = tr.find_all("th")
-        if ths and len(ths) >= 8:
-            header_tr = tr
-            header_cells = [th.get_text(" ", strip=True) for th in ths]
-            break
-
-    if not header_cells:
-        # tentativa: primeira linha
-        cells = all_tr[0].find_all(["td", "th"])
-        header_tr = all_tr[0]
-        header_cells = [c.get_text(" ", strip=True) for c in cells]
-
-    hnorm = [re.sub(r"\s+", " ", (h or "").strip()).lower() for h in header_cells]
-
-    def find_idx_contains(*needles: str) -> Optional[int]:
-        needles = tuple(n.lower() for n in needles)
+    def idx_contains(*needles: str) -> Optional[int]:
         for i, h in enumerate(hnorm):
             for n in needles:
-                if n in h:
+                if n.lower() in h:
                     return i
         return None
 
-    idx_item = find_idx_contains("item")
-    idx_prod = find_idx_contains("produto")
-    idx_val_merc = find_idx_contains("val. mercadoria", "val mercadoria")
-    idx_red_bc = find_idx_contains("redução", "reducao")
-    idx_bc_merc = find_idx_contains("base calc. mercadoria", "base calc mercadoria")
-    idx_frete = find_idx_contains("frete fob")
-    idx_bc_frete = find_idx_contains("base calc. frete", "base calc frete")
-    idx_bc_final = find_idx_contains("base calc. final", "base calc final")
-    idx_aliq_int = find_idx_contains("alíq. interna", "aliq. interna", "aliq interna")
-    idx_aliq_nfe = find_idx_contains("orig. nfe", "orig nfe")
-    idx_aliq_cte = find_idx_contains("orig. cte", "orig cte")
-    idx_deb_merc = find_idx_contains("débito mercadoria", "debito mercadoria")
-    idx_deb_frete = find_idx_contains("débito frete", "debito frete")
-    idx_cred_nfe = find_idx_contains("crédito nfe", "credito nfe")
-    idx_cred_cte = find_idx_contains("crédito cte", "credito cte")
-    idx_cred_comp = find_idx_contains("créd. comple", "cred. comple", "cred comple")
-    idx_recolher = find_idx_contains("a recolher")
+    idx_item = idx_contains("item")
+    idx_prod = idx_contains("produto")
+    idx_val_merc = idx_contains("val. mercadoria", "val mercadoria")
+    idx_red = idx_contains("redução", "reducao")
+    idx_bc_merc = idx_contains("base calc. mercadoria", "base calc mercadoria")
+    idx_frete = idx_contains("frete fob")
+    idx_bc_frete = idx_contains("base calc. frete", "base calc frete")
+    idx_bc_final = idx_contains("base calc. final", "base calc final")
+    idx_aliq_int = idx_contains("alíq. interna", "aliq. interna", "aliq interna")
+    idx_aliq_nfe = idx_contains("orig. nfe", "orig nfe")
+    idx_aliq_cte = idx_contains("orig. cte", "orig cte")
+    idx_deb_merc = idx_contains("débito mercadoria", "debito mercadoria")
+    idx_deb_frete = idx_contains("débito frete", "debito frete")
+    idx_cred_nfe = idx_contains("crédito nfe", "credito nfe")
+    idx_cred_cte = idx_contains("crédito cte", "credito cte")
+    idx_cred_comp = idx_contains("créd. comple", "cred. comple", "credito comple", "complement")
+    idx_recolher = idx_contains("a recolher", "recolher")
+
+    def get(row: List[str], i: Optional[int]) -> Optional[str]:
+        if i is None or i < 0 or i >= len(row):
+            return None
+        v = (row[i] or "").strip()
+        return v if v != "" else None
 
     out: List[Dict[str, Any]] = []
-    for tr in all_tr:
-        if tr == header_tr:
+    for r in rows:
+        item = get(r, idx_item)
+        if not item or not re.fullmatch(r"\d+", item):
             continue
-        tds = tr.find_all("td")
-        if not tds:
-            continue
-
-        cols = [td.get_text(" ", strip=True) for td in tds]
-        # precisa ter ao menos item+produto
-        if len(cols) < 3:
-            continue
-
-        def get(i: Optional[int]) -> Optional[str]:
-            if i is None or i >= len(cols):
-                return None
-            v = (cols[i] or "").strip()
-            return v or None
-
-        item = {
-            "item": get(idx_item),
-            "produto": get(idx_prod),
-            "val_mercadoria": get(idx_val_merc),
-            "perc_reducao_bc": get(idx_red_bc),
-            "base_calc_mercadoria": get(idx_bc_merc),
-            "frete_fob_cte": get(idx_frete),
-            "base_calc_frete_fob": get(idx_bc_frete),
-            "base_calc_final": get(idx_bc_final),
-            "aliq_interna": get(idx_aliq_int),
-            "aliq_orig_nfe": get(idx_aliq_nfe),
-            "aliq_orig_cte": get(idx_aliq_cte),
-            "debito_mercadoria": get(idx_deb_merc),
-            "debito_frete_fob": get(idx_deb_frete),
-            "credito_nfe": get(idx_cred_nfe),
-            "credito_cte": get(idx_cred_cte),
-            "credito_complementar": get(idx_cred_comp),
-            "valor_a_recolher": get(idx_recolher),
-            "cols_raw": cols,
-        }
-
-        if not (item["item"] and re.fullmatch(r"\d+", item["item"])):
-            continue
-
-        out.append(item)
+        out.append({
+            "item": item,
+            "produto": get(r, idx_prod),
+            "val_mercadoria": get(r, idx_val_merc),
+            "perc_reducao_bc": get(r, idx_red),
+            "base_calc_mercadoria": get(r, idx_bc_merc),
+            "frete_fob_cte": get(r, idx_frete),
+            "base_calc_frete_fob": get(r, idx_bc_frete),
+            "base_calc_final": get(r, idx_bc_final),
+            "aliq_interna": get(r, idx_aliq_int),
+            "aliq_orig_nfe": get(r, idx_aliq_nfe),
+            "aliq_orig_cte": get(r, idx_aliq_cte),
+            "debito_mercadoria": get(r, idx_deb_merc),
+            "debito_frete_fob": get(r, idx_deb_frete),
+            "credito_nfe": get(r, idx_cred_nfe),
+            "credito_cte": get(r, idx_cred_cte),
+            "credito_complementar": get(r, idx_cred_comp),
+            "valor_a_recolher": get(r, idx_recolher),
+            "cols_raw": r,
+        })
 
     return out
 
 
-def _merge_itens(itens_nota: List[Dict[str, Any]], calc_itens: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    # índice por item, e também por item+produto quando possível
-    idx_item: Dict[str, Dict[str, Any]] = {}
-    idx_item_prod: Dict[Tuple[str, str], Dict[str, Any]] = {}
+def _mesclar_itens_com_calculo(itens: List[Dict[str, Any]], calculos: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    calc_map = {str(c.get("item") or "").strip(): c for c in (calculos or []) if c.get("item")}
+    merged: List[Dict[str, Any]] = []
 
-    for c in calc_itens:
-        it = str(c.get("item") or "").strip()
-        pr = str(c.get("produto") or "").strip()
-        if it:
-            idx_item[it] = c
-            if pr:
-                idx_item_prod[(it, pr)] = c
-
-    mesclados: List[Dict[str, Any]] = []
     sem_calculo = 0
+    for it in itens:
+        k = str(it.get("item") or "").strip()
+        c = calc_map.get(k)
+        it2 = dict(it)
 
-    for n in itens_nota:
-        it = str(n.get("item") or "").strip()
-        pr = str(n.get("produto_sefin") or "").strip()
-
-        calc = None
-        if it and pr and (it, pr) in idx_item_prod:
-            calc = idx_item_prod[(it, pr)]
-        elif it and it in idx_item:
-            calc = idx_item[it]
-
-        merged = dict(n)
-        if calc:
-            # injeta campos do cálculo
-            merged.update({
-                "calc_produto": calc.get("produto"),
-                "calc_val_mercadoria": calc.get("val_mercadoria"),
-                "calc_perc_reducao_bc": calc.get("perc_reducao_bc"),
-                "calc_base_calc_mercadoria": calc.get("base_calc_mercadoria"),
-                "calc_frete_fob_cte": calc.get("frete_fob_cte"),
-                "calc_base_calc_frete_fob": calc.get("base_calc_frete_fob"),
-                "calc_base_calc_final": calc.get("base_calc_final"),
-                "calc_aliq_interna": calc.get("aliq_interna"),
-                "calc_aliq_orig_nfe": calc.get("aliq_orig_nfe"),
-                "calc_aliq_orig_cte": calc.get("aliq_orig_cte"),
-                "calc_debito_mercadoria": calc.get("debito_mercadoria"),
-                "calc_debito_frete_fob": calc.get("debito_frete_fob"),
-                "calc_credito_nfe": calc.get("credito_nfe"),
-                "calc_credito_cte": calc.get("credito_cte"),
-                "calc_credito_complementar": calc.get("credito_complementar"),
-                "calc_valor_a_recolher": calc.get("valor_a_recolher"),
+        if c:
+            it2.update({
+                "calc_produto": c.get("produto"),
+                "calc_val_mercadoria": c.get("val_mercadoria"),
+                "calc_perc_reducao_bc": c.get("perc_reducao_bc"),
+                "calc_base_calc_mercadoria": c.get("base_calc_mercadoria"),
+                "calc_frete_fob_cte": c.get("frete_fob_cte"),
+                "calc_base_calc_frete_fob": c.get("base_calc_frete_fob"),
+                "calc_base_calc_final": c.get("base_calc_final"),
+                "calc_aliq_interna": c.get("aliq_interna"),
+                "calc_aliq_orig_nfe": c.get("aliq_orig_nfe"),
+                "calc_aliq_orig_cte": c.get("aliq_orig_cte"),
+                "calc_debito_mercadoria": c.get("debito_mercadoria"),
+                "calc_debito_frete_fob": c.get("debito_frete_fob"),
+                "calc_credito_nfe": c.get("credito_nfe"),
+                "calc_credito_cte": c.get("credito_cte"),
+                "calc_credito_complementar": c.get("credito_complementar"),
+                "calc_valor_a_recolher": c.get("valor_a_recolher"),
+                "calc_found": True,
             })
         else:
-            sem_calculo += 1
-            merged.update({
+            it2.update({
+                "calc_found": False,
                 "calc_valor_a_recolher": None,
             })
+            sem_calculo += 1
 
-        mesclados.append(merged)
+        merged.append(it2)
 
     diag = {
-        "itens_nota": len(itens_nota),
-        "calc_itens": len(calc_itens),
+        "calculo_linhas": len(calculos or []),
+        "itens_linhas": len(itens or []),
         "itens_sem_calculo": sem_calculo,
     }
-    return mesclados, diag
+    return merged, diag
 
 
 # =========================================================
-# ROUTE: EXTRATO PRODUTO
+# /extrato-produto
 # =========================================================
 @app.get("/extrato-produto")
 def extrato_produto(
@@ -868,26 +840,23 @@ def extrato_produto(
         html_intern = r2.text
         final_url = r2.url
 
-        # 1) Itens da Nota (NCM/CFOP/CEST/Produto SEFIN...)
-        table_itens, diag_itens = _pick_best_items_table(html_intern)
+        # --------- Itens da Nota (NCM etc.)
+        itens_table, diag_itens = _pick_best_items_table(html_intern)
         itens_nota: List[Dict[str, Any]] = []
-        if table_itens and (diag_itens.get("best_score", 0) >= 60):
-            itens_nota = _parse_items_from_table(table_itens)
+        if itens_table and (diag_itens.get("best_score", 0) >= 60):
+            itens_nota = _parse_items_from_table(itens_table)
 
-        # 2) Cálculo Itens (Val. a Recolher por item)
-        table_calc, diag_calc = _find_calculo_itens_table(html_intern)
-        calc_itens: List[Dict[str, Any]] = []
-        if table_calc:
-            calc_itens = _parse_calculo_itens(table_calc)
+        # --------- Cálculo Itens (Val. a Recolher etc.)
+        calc_table = _find_table_by_title(html_intern, "Cálculo Itens")
+        calculo_itens: List[Dict[str, Any]] = []
+        if calc_table:
+            calculo_itens = _parse_calculo_itens_table(calc_table)
 
-        # 3) Merge
-        itens_mesclados, diag_merge = _merge_itens(itens_nota, calc_itens)
+        # --------- Mescla
+        itens_mesclados, diag_merge = _mesclar_itens_com_calculo(itens_nota, calculo_itens)
 
-        # totais
-        tot_itens = len(itens_nota)
-        tot_sem_ncm = sum(1 for x in itens_nota if not x.get("ncm"))
-        tot_calc = len(calc_itens)
-        tot_sem_calc = diag_merge.get("itens_sem_calculo", 0)
+        ok_itens = len(itens_nota) > 0
+        ok_calc = len(calculo_itens) > 0
 
         return {
             "ok": True,
@@ -901,21 +870,24 @@ def extrato_produto(
                 "usuario": usuario,
                 "chave": chave_alvo,
 
-                # mantém os 3 blocos, para debug/visualização
-                "itens_nota": itens_nota,
-                "calculo_itens": calc_itens,
-                "itens_mesclados": itens_mesclados,
+                # ✅ saídas
+                "itens": itens_mesclados,          # <- MESCLADO
+                "itens_nota": itens_nota,          # <- só itens
+                "calculo_itens": calculo_itens,    # <- só cálculo
 
                 "totais": {
-                    "qtd_itens_nota": tot_itens,
-                    "itens_sem_ncm": tot_sem_ncm,
-                    "qtd_calculo_itens": tot_calc,
-                    "itens_sem_calculo": tot_sem_calc,
+                    "qtd_itens": len(itens_mesclados),
+                    "itens_sem_ncm": sum(1 for x in itens_mesclados if not x.get("ncm")),
+                    "itens_sem_calculo": diag_merge.get("itens_sem_calculo", 0),
+                    "qtd_calculo_itens": len(calculo_itens),
+                    "ok_itens_nota": ok_itens,
+                    "ok_calculo_itens": ok_calc,
                 },
+
                 "diagnostico": {
-                    "itens_nota": diag_itens,
-                    "calculo_itens": diag_calc,
+                    "itens_da_nota": diag_itens,
                     "merge": diag_merge,
+                    "calculo_found": bool(calc_table),
                 },
             },
         }
@@ -927,6 +899,17 @@ def extrato_produto(
                     os.remove(p)
             except Exception:
                 pass
+
+
+# Alias compatível (porque você tentou /extrato e deu 404)
+@app.get("/extrato")
+def extrato_alias(
+    user: str = Query(...),
+    codi: str = Query(...),
+    url_extrato: str = Query(...),
+    chave: str = Query(""),
+):
+    return extrato_produto(user=user, codi=codi, url_extrato=url_extrato, chave=chave)
 
 
 if __name__ == "__main__":
