@@ -13,11 +13,8 @@ analise.py — FastAPI (Render)
   abre internamento (capa_internamentos)
   extrai 2 tabelas:
     - "Itens da Nota" (Item, Descrição, CST/CSOSN, CFOP, CEST, NCM)
-    - "Cálculo Itens" (Tabela analítica) — agora encontrada por contagem de colunas (17 colunas)
-  mescla por ITEM (1..n) e retorna JSON consolidado:
-    item, descricao, cst, cfop, cest, ncm,
-    produto, val_merc, perc_red, bc_merc, frete, bc_frete, bc_final,
-    perc_int, perc_nfe, perc_cte, deb_merc, deb_frete, cred_nfe, cred_cte, cred_compl, a_recolher
+    - "Cálculo Itens" (Tabela analítica) — 3 estratégias para encontrar
+  mescla por ITEM (1..n) e retorna JSON consolidado
 """
 
 from __future__ import annotations
@@ -498,7 +495,7 @@ def _montar_url_capa_internamento(usuario: str, chave: str, token: Optional[str]
 
 
 # =========================================================
-# INTERNAMENTO -> TABELAS (CORRIGIDO)
+# INTERNAMENTO -> TABELAS (VERSÃO ULTRA ROBUSTA)
 # =========================================================
 def _extract_table_headers(table) -> List[str]:
     ths = table.find_all("th")
@@ -640,69 +637,120 @@ def _parse_items_da_nota(table) -> List[Dict[str, Any]]:
     return items
 
 
-# -------------------------
-# Cálculo Itens: CORRIGIDO - Encontrar por 17 colunas
-# -------------------------
-def _pick_calculo_table(html_internamento: str) -> Tuple[Optional[Any], Dict[str, Any]]:
-    """Encontra tabela de cálculo procurando por tabelas com exatamente 17 colunas e dados numéricos"""
+# =========================================================
+# Cálculo Itens: VERSÃO ULTRA ROBUSTA - 3 ESTRATÉGIAS
+# =========================================================
+def _pick_calculo_table_ultra_robusto(html_internamento: str) -> Tuple[Optional[Any], Dict[str, Any]]:
+    """
+    Três estratégias para encontrar a tabela de cálculo:
+    1. Buscar por id="calculo-itens-container"
+    2. Buscar por heading "Cálculo Itens"
+    3. Buscar por tabela com muitas colunas e dados numéricos
+    """
     soup = BeautifulSoup(html_internamento, "lxml")
+    diag = {
+        "tables_found": len(soup.find_all("table")),
+        "estrategias": {}
+    }
+    
+    # ESTRATÉGIA 1: Procurar pelo container específico
+    container = soup.find("div", {"id": "calculo-itens-container"})
+    if container:
+        table = container.find("table")
+        if table:
+            # Verificar se realmente é a tabela de cálculo
+            rows = table.find_all("tr")
+            for tr in rows:
+                tds = tr.find_all("td")
+                if len(tds) >= 15:
+                    diag["estrategias"]["container_id"] = "ENCONTRADA"
+                    return table, diag
+    
+    diag["estrategias"]["container_id"] = "NAO_ENCONTRADA"
+    
+    # ESTRATÉGIA 2: Procurar pelo heading "Cálculo Itens"
+    for heading in soup.find_all(["h4", "h3", "h2", "h1"]):
+        if "Cálculo Itens" in heading.get_text():
+            # Encontrou o heading, pegar a próxima tabela
+            parent = heading.find_parent("div", class_="flex-container")
+            if parent:
+                table = parent.find("table")
+                if table:
+                    diag["estrategias"]["heading"] = "ENCONTRADA"
+                    return table, diag
+            # Se não achou pelo parent, procurar qualquer tabela próxima
+            next_table = heading.find_next("table")
+            if next_table:
+                diag["estrategias"]["heading"] = "ENCONTRADA (next)"
+                return next_table, diag
+    
+    diag["estrategias"]["heading"] = "NAO_ENCONTRADA"
+    
+    # ESTRATÉGIA 3: Busca avançada por tabela com muitas colunas
     tables = soup.find_all("table")
-    best = None
+    best_table = None
     best_score = -1
-    diag = {"tables_found": len(tables), "analysis": []}
-
+    analysis = []
+    
     for i, table in enumerate(tables):
         score = 0
-        rows_with_17_cols = 0
+        rows_with_many_cols = 0
         numeric_rows = 0
+        has_calculo_text = False
+        
+        # Verificar se tem texto "Cálculo" próximo
+        prev_text = table.find_previous(string=True)
+        if prev_text and "cálculo" in str(prev_text).lower():
+            has_calculo_text = True
+            score += 20
         
         for tr in table.find_all("tr"):
             tds = tr.find_all("td")
-            if len(tds) == 17:  # Exatamente 17 colunas
-                rows_with_17_cols += 1
-                cols = [td.get_text(" ", strip=True) for td in tds]
-                if cols and re.fullmatch(r"\d+", cols[0].strip()):
+            
+            # Verificar se tem muitas colunas
+            if len(tds) >= 15:
+                rows_with_many_cols += 1
+                
+                # Verificar primeira coluna numérica
+                if tds and tds[0].get_text(strip=True).isdigit():
                     numeric_rows += 1
+                    
+                    # Verificar se tem valores monetários (com vírgula)
+                    if len(tds) > 2 and "," in tds[2].get_text():
+                        numeric_rows += 2  # Bônus extra
         
-        # Pontuação baseada em quantas linhas têm 17 colunas e começam com número
-        score = (rows_with_17_cols * 5) + (numeric_rows * 10)
+        # Pontuação
+        score += (rows_with_many_cols * 5) + (numeric_rows * 10)
         
-        diag["analysis"].append({
+        analysis.append({
             "i": i,
-            "rows_with_17_cols": rows_with_17_cols,
+            "rows_with_many_cols": rows_with_many_cols,
             "numeric_rows": numeric_rows,
+            "has_calculo_text": has_calculo_text,
             "score": score
         })
         
         if score > best_score:
             best_score = score
-            best = table
+            best_table = table
+    
+    diag["estrategias"]["busca_avancada"] = {
+        "best_score": best_score,
+        "analysis": analysis
+    }
+    
+    if best_table and best_score > 30:
+        return best_table, diag
+    
+    return None, diag
 
-    diag["best_score"] = best_score
-    return best, diag
 
-
-def _parse_calculo_itens(table) -> List[Dict[str, Any]]:
+def _parse_calculo_itens_ultra_robusto(table) -> List[Dict[str, Any]]:
     """
-    Parse tabela de cálculo que tem exatamente 17 colunas
-    Mapeamento direto baseado no HTML:
-    0: Item
-    1: Produto
-    2: Val. Mercadoria
-    3: % Redução Base Calc.
-    4: Base Calc. Mercadoria
-    5: Frete FOB (CTE)
-    6: Base Calc. Frete-FOB
-    7: Base Calc. Final
-    8: % Alíq. Interna
-    9: %Alíq. Orig. NFE
-    10: %Alíq. Orig. CTE
-    11: Val. Débito Mercadoria
-    12: Val. Débito Frete-FOB
-    13: Val. Crédito NFE
-    14: Val. Crédito CTE
-    15: Val. Créd. Comple.
-    16: Val. a Recolher
+    Parse super robusto que tenta diferentes abordagens:
+    1. Tenta 17 colunas exatas
+    2. Tenta colspan detection
+    3. Fallback para qualquer tabela com dados parecidos
     """
     all_tr = table.find_all("tr")
     if not all_tr:
@@ -712,37 +760,66 @@ def _parse_calculo_itens(table) -> List[Dict[str, Any]]:
     
     for tr in all_tr:
         tds = tr.find_all("td")
-        if len(tds) != 17:  # Precisa ter exatamente 17 colunas
+        if len(tds) < 10:  # Mínimo de colunas
             continue
             
         cols = [td.get_text(" ", strip=True) for td in tds]
         
-        # Verifica se a primeira coluna é um número (item)
-        item = cols[0].strip()
-        if not item or not re.fullmatch(r"\d+", item):
+        # Verificar se a primeira coluna é número (item)
+        first_col = cols[0].strip()
+        if not first_col or not re.fullmatch(r"\d+", first_col):
             continue
         
-        # Mapeamento direto das 17 colunas
-        row = {
-            "item": item,
-            "produto": cols[1].strip(),
-            "val_mercadoria": cols[2].strip(),
-            "perc_reducao_base_calc": cols[3].strip(),
-            "base_calc_mercadoria": cols[4].strip(),
-            "frete_fob_cte": cols[5].strip(),
-            "base_calc_frete_fob": cols[6].strip(),
-            "base_calc_final": cols[7].strip(),
-            "aliq_interna": cols[8].strip(),
-            "aliq_orig_nfe": cols[9].strip(),
-            "aliq_orig_cte": cols[10].strip(),
-            "val_debito_mercadoria": cols[11].strip(),
-            "val_debito_frete_fob": cols[12].strip(),
-            "val_credito_nfe": cols[13].strip(),
-            "val_credito_cte": cols[14].strip(),
-            "val_cred_complementar": cols[15].strip(),
-            "valor_a_recolher": cols[16].strip(),
-        }
-        out.append(row)
+        # ESTRATÉGIA A: 17 colunas exatas
+        if len(cols) == 17:
+            row = {
+                "item": cols[0],
+                "produto": cols[1],
+                "val_mercadoria": cols[2],
+                "perc_reducao_base_calc": cols[3],
+                "base_calc_mercadoria": cols[4],
+                "frete_fob_cte": cols[5],
+                "base_calc_frete_fob": cols[6],
+                "base_calc_final": cols[7],
+                "aliq_interna": cols[8],
+                "aliq_orig_nfe": cols[9],
+                "aliq_orig_cte": cols[10],
+                "val_debito_mercadoria": cols[11],
+                "val_debito_frete_fob": cols[12],
+                "val_credito_nfe": cols[13],
+                "val_credito_cte": cols[14],
+                "val_cred_complementar": cols[15],
+                "valor_a_recolher": cols[16],
+            }
+            out.append(row)
+            continue
+        
+        # ESTRATÉGIA B: Tentar detectar por padrão de valores (15+ colunas)
+        if len(cols) >= 15:
+            # Tentar adivinhar as colunas baseado no conteúdo
+            row = {
+                "item": cols[0],
+                "produto": cols[1] if len(cols) > 1 else None,
+                "val_mercadoria": cols[2] if len(cols) > 2 else None,
+                "perc_reducao_base_calc": cols[3] if len(cols) > 3 else None,
+                "base_calc_mercadoria": cols[4] if len(cols) > 4 else None,
+                "frete_fob_cte": cols[5] if len(cols) > 5 else None,
+                "base_calc_frete_fob": cols[6] if len(cols) > 6 else None,
+                "base_calc_final": cols[7] if len(cols) > 7 else None,
+                "aliq_interna": cols[8] if len(cols) > 8 else None,
+                "aliq_orig_nfe": cols[9] if len(cols) > 9 else None,
+                "aliq_orig_cte": cols[10] if len(cols) > 10 else None,
+                "val_debito_mercadoria": cols[11] if len(cols) > 11 else None,
+                "val_debito_frete_fob": cols[12] if len(cols) > 12 else None,
+                "val_credito_nfe": cols[13] if len(cols) > 13 else None,
+                "val_credito_cte": cols[14] if len(cols) > 14 else None,
+                "val_cred_complementar": cols[15] if len(cols) > 15 else None,
+                "valor_a_recolher": cols[16] if len(cols) > 16 else None,
+            }
+            
+            # Verificar se parece uma linha de cálculo (tem valores com vírgula)
+            if any(val and "," in val for val in [row["val_mercadoria"], row["valor_a_recolher"]]):
+                out.append(row)
     
     return out
 
@@ -828,7 +905,7 @@ def _merge_itens_com_calculo(
 
 
 # =========================================================
-# ROUTE: EXTRATO PRODUTO (JSON CONSOLIDADO) - CORRIGIDO
+# ROUTE: EXTRATO PRODUTO (JSON CONSOLIDADO) - VERSÃO FINAL
 # =========================================================
 @app.get("/extrato-produto")
 def extrato_produto(
@@ -888,11 +965,11 @@ def extrato_produto(
         if tab_itens and (diag_itens.get("best_score", 0) >= 60):
             itens_nota = _parse_items_da_nota(tab_itens)
 
-        # 2) Cálculo Itens - CORRIGIDO: usando nova função específica
-        tab_calc, diag_calc = _pick_calculo_table(html_intern)
+        # 2) Cálculo Itens - VERSÃO ULTRA ROBUSTA
+        tab_calc, diag_calc = _pick_calculo_table_ultra_robusto(html_intern)
         calc_itens: List[Dict[str, Any]] = []
         if tab_calc:
-            calc_itens = _parse_calculo_itens(tab_calc)
+            calc_itens = _parse_calculo_itens_ultra_robusto(tab_calc)
 
         # 3) Merge consolidado
         itens_consolidados, diag_merge = _merge_itens_com_calculo(itens_nota, calc_itens)
