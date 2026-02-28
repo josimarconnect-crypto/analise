@@ -1,16 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 extrato_api.py — FastAPI (Render)
-
-Rotas:
+✅ Rotas:
 - /health
 - /empresas?user=...
 - /debitos?user=...&codi=...&incluir_ano_anterior=1
 - /extrato-produto?user=...&codi=...&url_extrato=...&chave=...
 
-Login: DET -> Portal usando mTLS (cert pem/key do Supabase)
-
-EXTRATO-PRODUTO:
+✅ Login: DET -> Portal usando mTLS (cert pem/key do Supabase)
+✅ /extrato-produto:
   abre extrato.jsp, extrai TOKEN + USUARIO e CHAVE (44 dígitos)
   monta capa_internamentos e segue até processamentos/show
   extrai:
@@ -18,10 +16,9 @@ EXTRATO-PRODUTO:
     - "Cálculo Itens" (Val. a Recolher.)
   mescla por ITEM e retorna JSON completo
 
-Correção principal:
-  - A tabela "Itens do Lançamento" também tem "Valor a Recolher" e estava sendo
-    escolhida por engano. Agora pegamos a tabela do cálculo pelo título
-    "Cálculo Itens" (h4.table-title) ou pelo seletor tr.itens-calculos-row.
+✅ Correção aplicada:
+- Parser do "Cálculo Itens" robusto: escolhe header correto + mapeia colunas por regex
+  (resolve caso em que calc_produto vinha "762,50" e os demais campos ficavam null)
 """
 
 from __future__ import annotations
@@ -48,8 +45,12 @@ import uvicorn
 # =========================================================
 # CONFIG
 # =========================================================
-SUPABASE_URL = "https://hysrxadnigzqadnlkynq.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://hysrxadnigzqadnlkynq.supabase.co").strip()
+SUPABASE_KEY = os.getenv(
+    "SUPABASE_KEY",
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA",
+).strip()
+
 TABELA_CERTS = os.getenv("TABELA_CERTS", "certifica_dfe").strip()
 
 DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "1") == "1"
@@ -500,134 +501,90 @@ def _montar_url_capa_internamento(usuario: str, chave: str, token: Optional[str]
     return base
 
 
-def _resolve_processamentos_show_url(base_url: str, html: str) -> Optional[str]:
-    """
-    Em alguns fluxos, a "capa_internamentos" aponta/embute a URL real:
-    /processamentos/show?chave=...&id_nf=...
-    """
-    # 1) href direto
-    m = re.search(r"(https://internamentonotas\.sefin\.ro\.gov\.br/processamentos/show[^\"'\s>]+)", html)
-    if m:
-        return m.group(1)
-
-    # 2) path relativo
-    m2 = re.search(r"(/processamentos/show[^\"'\s>]+)", html)
-    if m2:
-        return requests.compat.urljoin(base_url, m2.group(1))
-
-    return None
-
-
 # =========================================================
-# INTERNAMENTO -> LOCALIZAR TABELAS CERTAS
+# INTERNAMENTO -> TABELAS
 # =========================================================
-def _norm(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"\s+", " ", s)
-    return s
+def _extract_table_headers(table) -> List[str]:
+    ths = table.find_all("th")
+    if ths:
+        return [th.get_text(" ", strip=True) for th in ths]
+    tr = table.find("tr")
+    if tr:
+        cells = tr.find_all(["td", "th"])
+        return [c.get_text(" ", strip=True) for c in cells]
+    return []
 
 
-def _find_table_by_title(html: str, title_contains: str) -> Tuple[Optional[Any], Dict[str, Any]]:
-    """
-    Pega a tabela que aparece dentro do bloco cujo <h4 class="table-title"> contém title_contains.
-    No HTML real, "Cálculo Itens" vem exatamente assim. :contentReference[oaicite:2]{index=2}
-    """
-    soup = BeautifulSoup(html, "lxml")
-    wanted = _norm(title_contains)
-    hs = soup.find_all(["h3", "h4"])
-    for h in hs:
-        if _norm(h.get_text(" ", strip=True)).find(wanted) >= 0:
-            # tenta achar a tabela dentro do mesmo "card-body"/container
-            parent = h
-            for _ in range(6):
-                if not parent:
-                    break
-                # tabela dentro do parent
-                t = parent.find("table")
-                if t:
-                    return t, {"strategy": "by_title", "title": h.get_text(" ", strip=True)}
-                parent = parent.parent
-
-            # fallback: próxima tabela após o título
-            nxt = h.find_next("table")
-            if nxt:
-                return nxt, {"strategy": "next_table", "title": h.get_text(" ", strip=True)}
-
-    return None, {"strategy": "not_found"}
+def _score_headers(headers: List[str]) -> int:
+    """Score genérico (itens da nota)."""
+    h = " | ".join([x.strip().lower() for x in headers if x]).lower()
+    score = 0
+    for kw, pts in [
+        ("itens da nota", 60),
+        ("ncm", 50),
+        ("cfop", 30),
+        ("cest", 20),
+        ("produto sefin", 20),
+        ("descricao", 10),
+        ("descr", 10),
+        ("item", 10),
+    ]:
+        if kw in h:
+            score += pts
+    return score
 
 
-def _find_table_calculo_itens(html: str) -> Tuple[Optional[Any], Dict[str, Any]]:
-    """
-    Evita pegar a tabela errada "itens_lancamentos" (resumo) e pega a tabela detalhada,
-    que tem linhas tr.itens-calculos-row. :contentReference[oaicite:3]{index=3}
-    """
-    # 1) pelo título "Cálculo Itens"
-    t, diag = _find_table_by_title(html, "Cálculo Itens")
-    if t:
-        return t, {**diag, "picked": "calculo_itens"}
+def _score_headers_calculo(headers: List[str]) -> int:
+    """Score específico (cálculo itens)."""
+    h = " | ".join([x.strip().lower() for x in headers if x]).lower()
+    score = 0
+    for kw, pts in [
+        ("calculo itens", 60),
+        ("cálculo itens", 60),
+        ("val. a recolher", 80),
+        ("val a recolher", 80),
+        ("base calc. final", 50),
+        ("base calc final", 50),
+        ("frete fob", 30),
+        ("val. debito mercadoria", 30),
+        ("val. credito nfe", 25),
+        ("item", 20),
+        ("produto", 15),
+        ("val. mercadoria", 15),
+    ]:
+        if kw in h:
+            score += pts
+    return score
 
-    # 2) fallback por seletor de linha
-    soup = BeautifulSoup(html, "lxml")
-    row = soup.select_one("tr.itens-calculos-row")
-    if row:
-        table = row.find_parent("table")
-        if table:
-            return table, {"strategy": "by_selector", "picked": "calculo_itens"}
 
-    return None, {"strategy": "not_found", "picked": "calculo_itens"}
-
-
-def _find_table_itens_da_nota(html: str) -> Tuple[Optional[Any], Dict[str, Any]]:
-    """
-    Mantém seu método genérico, mas tenta primeiro pelo título, se existir.
-    """
-    # se existir algum título de itens, tenta:
-    t, diag = _find_table_by_title(html, "Itens da Nota")
-    if t:
-        return t, {**diag, "picked": "itens_da_nota"}
-
-    # fallback: tenta achar a tabela grande com colunas NCM/CFOP/CEST
-    soup = BeautifulSoup(html, "lxml")
+def _pick_best_table(html_internamento: str, scorer) -> Tuple[Optional[Any], Dict[str, Any]]:
+    soup = BeautifulSoup(html_internamento, "lxml")
+    tables = soup.find_all("table")
     best = None
     best_score = -1
-    diag2 = {"strategy": "fallback_score", "scores": []}
+    diag = {"tables_found": len(tables), "scores": []}
 
-    for i, table in enumerate(soup.find_all("table")):
-        headers = [th.get_text(" ", strip=True) for th in table.find_all("th")]
-        h = _norm(" | ".join(headers))
-        sc = 0
-        for kw, pts in [
-            ("ncm", 50),
-            ("cfop", 30),
-            ("cest", 20),
-            ("item", 10),
-            ("descr", 10),
-        ]:
-            if kw in h:
-                sc += pts
-        diag2["scores"].append({"i": i, "score": sc, "headers": headers[:20]})
+    for i, t in enumerate(tables):
+        headers = _extract_table_headers(t)
+        sc = scorer(headers)
+        diag["scores"].append({"i": i, "score": sc, "headers_sample": headers[:30]})
         if sc > best_score:
             best_score = sc
-            best = table
+            best = t
 
-    diag2["best_score"] = best_score
-    if best and best_score >= 60:
-        return best, diag2
-
-    return None, {"strategy": "not_found", "picked": "itens_da_nota", "diag": diag2}
+    diag["best_score"] = best_score
+    return best, diag
 
 
-# =========================================================
-# PARSERS
-# =========================================================
 def _parse_items_da_nota(table) -> List[Dict[str, Any]]:
+    """Tabela com NCM/CFOP/CEST/Produto SEFIN."""
     all_tr = table.find_all("tr")
     if not all_tr:
         return []
 
     header_cells: List[str] = []
     header_tr = None
-    for tr in all_tr[:15]:
+    for tr in all_tr[:10]:
         ths = tr.find_all("th")
         if ths and len(ths) >= 6:
             header_cells = [th.get_text(" ", strip=True) for th in ths]
@@ -639,22 +596,22 @@ def _parse_items_da_nota(table) -> List[Dict[str, Any]]:
         header_cells = [c.get_text(" ", strip=True) for c in cells]
         header_tr = all_tr[0]
 
-    hnorm = [_norm(h) for h in header_cells]
+    hnorm = [re.sub(r"\s+", " ", (h or "").strip()).lower() for h in header_cells]
 
     def find_idx(*names: str) -> Optional[int]:
         for n in names:
-            n = _norm(n)
+            n = n.lower()
             for i, h in enumerate(hnorm):
                 if n in h:
                     return i
         return None
 
     idx_item = find_idx("item")
-    idx_desc = find_idx("descr", "descrição", "descricao")
+    idx_desc = find_idx("descr", "descrição")
     idx_cfop = find_idx("cfop")
     idx_cest = find_idx("cest")
     idx_ncm = find_idx("ncm")
-    idx_prod_sefin = find_idx("produto sefin", "produto")
+    idx_prod_sefin = find_idx("produto sefin")
 
     items: List[Dict[str, Any]] = []
     for tr in all_tr:
@@ -684,9 +641,9 @@ def _parse_items_da_nota(table) -> List[Dict[str, Any]]:
             "cols_raw": cols,
         }
 
-        if not (item["item"] and re.fullmatch(r"\d+", str(item["item"]).strip())):
+        if not (item["item"] and re.fullmatch(r"\d+", item["item"] or "")):
             continue
-        if not (item["descricao"] or item["ncm"]):
+        if not (item["descricao"] or item["ncm"] or item["produto_sefin"]):
             continue
 
         items.append(item)
@@ -694,57 +651,83 @@ def _parse_items_da_nota(table) -> List[Dict[str, Any]]:
     return items
 
 
+# =========================================================
+# ✅ PARSE CÁLCULO ITENS (ROBUSTO / CORRIGIDO)
+# =========================================================
 def _parse_calculo_itens(table) -> List[Dict[str, Any]]:
     """
-    Tabela 'Cálculo Itens' detalhada (linhas tr.itens-calculos-row).
+    Parser robusto da tabela 'Cálculo Itens' (a detalhada).
+    Corrige o problema de pegar header errado e deslocar as colunas.
     """
+
+    def norm(s: str) -> str:
+        s = (s or "").strip().lower()
+        s = s.replace("á", "a").replace("à", "a").replace("â", "a").replace("ã", "a")
+        s = s.replace("é", "e").replace("ê", "e")
+        s = s.replace("í", "i")
+        s = s.replace("ó", "o").replace("ô", "o").replace("õ", "o")
+        s = s.replace("ú", "u")
+        s = s.replace("ç", "c")
+        s = re.sub(r"\s+", " ", s)
+        return s
+
     all_tr = table.find_all("tr")
     if not all_tr:
         return []
 
-    header_cells: List[str] = []
+    # --- 1) acha o melhor header: tr com mais th e palavras-chave
     header_tr = None
-    for tr in all_tr[:15]:
+    header_cells: List[str] = []
+
+    best = (-1, -1)  # (qtd_th, score_keywords)
+    for tr in all_tr[:20]:
         ths = tr.find_all("th")
-        if ths and len(ths) >= 10:
-            header_cells = [th.get_text(" ", strip=True) for th in ths]
+        if not ths:
+            continue
+        cells = [th.get_text(" ", strip=True) for th in ths]
+        hjoin = norm(" | ".join(cells))
+
+        score = 0
+        for kw in ["item", "produto", "mercadoria", "base calc", "aliq", "recolher"]:
+            if kw in hjoin:
+                score += 1
+
+        key = (len(ths), score)
+        if key > best:
+            best = key
             header_tr = tr
-            break
+            header_cells = cells
 
-    if not header_cells:
-        # fallback
-        first = all_tr[0]
-        cells = first.find_all(["td", "th"])
-        header_cells = [c.get_text(" ", strip=True) for c in cells]
-        header_tr = first
+    if not header_tr or len(header_cells) < 8:
+        return []
 
-    hnorm = [_norm(h) for h in header_cells]
+    hnorm = [norm(h) for h in header_cells]
 
-    def find_idx_any(*needles: str) -> Optional[int]:
-        for needle in needles:
-            n = _norm(needle)
-            for i, h in enumerate(hnorm):
-                if n in h:
+    def find_idx_regex(*patterns: str) -> Optional[int]:
+        for i, h in enumerate(hnorm):
+            for pat in patterns:
+                if re.search(pat, h):
                     return i
         return None
 
-    idx_item = find_idx_any("item")
-    idx_produto = find_idx_any("produto")
-    idx_val_merc = find_idx_any("val. mercadoria", "val mercadoria")
-    idx_red = find_idx_any("% redução", "reducao base", "redução base")
-    idx_bc_merc = find_idx_any("base calc. mercadoria", "base calc mercadoria")
-    idx_frete = find_idx_any("frete fob", "frete")
-    idx_bc_frete = find_idx_any("base calc. frete", "base calc frete", "frete-fob")
-    idx_bc_final = find_idx_any("base calc. final", "base calc final")
-    idx_aliq_int = find_idx_any("% alíq. interna", "aliq. interna", "alíq. interna")
-    idx_aliq_nfe = find_idx_any("orig. nfe", "orig nfe")
-    idx_aliq_cte = find_idx_any("orig. cte", "orig cte")
-    idx_deb_merc = find_idx_any("débito mercadoria", "debito mercadoria")
-    idx_deb_frete = find_idx_any("débito frete", "debito frete")
-    idx_cred_nfe = find_idx_any("crédito nfe", "credito nfe")
-    idx_cred_cte = find_idx_any("crédito cte", "credito cte")
-    idx_cred_comp = find_idx_any("créd. comple", "cred. comple", "cred comple", "crédito compl", "credito compl")
-    idx_recolher = find_idx_any("val. a recolher", "valor a recolher", "a recolher", "recolher")
+    # --- 2) indices por regex (tolerante)
+    idx_item = find_idx_regex(r"\bitem\b")
+    idx_produto = find_idx_regex(r"\bproduto\b")
+    idx_val_merc = find_idx_regex(r"val\.?\s*mercadoria", r"\bmercadoria\b")
+    idx_red = find_idx_regex(r"reduc", r"%\s*reduc")
+    idx_bc_merc = find_idx_regex(r"base\s*calc\.?\s*merc", r"base\s*calc.*mercadoria")
+    idx_frete = find_idx_regex(r"frete")
+    idx_bc_frete = find_idx_regex(r"base\s*calc.*frete", r"base\s*calc.*fob")
+    idx_bc_final = find_idx_regex(r"base\s*calc\.?\s*final")
+    idx_aliq_int = find_idx_regex(r"aliq.*interna", r"interna")
+    idx_aliq_nfe = find_idx_regex(r"orig.*nfe")
+    idx_aliq_cte = find_idx_regex(r"orig.*cte")
+    idx_deb_merc = find_idx_regex(r"debito.*merc", r"debito\s*mercadoria")
+    idx_deb_frete = find_idx_regex(r"debito.*frete")
+    idx_cred_nfe = find_idx_regex(r"credito.*nfe")
+    idx_cred_cte = find_idx_regex(r"credito.*cte")
+    idx_cred_comp = find_idx_regex(r"cred.*compl", r"credito.*compl")
+    idx_recolher = find_idx_regex(r"recolher", r"a\s*recolher")
 
     def safe_get(cols: List[str], i: Optional[int]) -> Optional[str]:
         if i is None:
@@ -754,26 +737,23 @@ def _parse_calculo_itens(table) -> List[Dict[str, Any]]:
         v = (cols[i] or "").strip()
         return v or None
 
-    out: List[Dict[str, Any]] = []
-
-    # Prioriza linhas reais do cálculo (class="itens-calculos-row") quando existirem:
+    # --- 3) usa preferencialmente as linhas do cálculo (se existirem)
     trs = table.select("tr.itens-calculos-row") or [tr for tr in all_tr if tr != header_tr]
 
+    out: List[Dict[str, Any]] = []
     for tr in trs:
         tds = tr.find_all("td")
         if not tds:
             continue
+
         cols = [td.get_text(" ", strip=True) for td in tds]
-        if len(cols) < 6:
-            continue
 
         item = safe_get(cols, idx_item)
-        item_norm = (item or "").strip()
-        if not (item_norm and re.fullmatch(r"\d+", item_norm)):
+        if not (item and re.fullmatch(r"\d+", item.strip())):
             continue
 
         row = {
-            "item": item_norm,
+            "item": item.strip(),
             "produto": safe_get(cols, idx_produto),
             "val_mercadoria": safe_get(cols, idx_val_merc),
             "perc_reducao_base_calc": safe_get(cols, idx_red),
@@ -801,6 +781,7 @@ def _merge_itens_com_calculo(
     itens_nota: List[Dict[str, Any]],
     calculo: List[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Mescla pelo campo 'item' (1..n)."""
     calc_by_item: Dict[str, Dict[str, Any]] = {}
     for c in calculo or []:
         it = str(c.get("item") or "").strip()
@@ -879,7 +860,6 @@ def extrato_produto(
         if not ir_para_portal(sess):
             raise HTTPException(status_code=401, detail="Falha ao abrir Portal (LoginToken/home).")
 
-        # 1) abre extrato.jsp
         url_extrato_clean = (url_extrato or "").strip().replace("%22", "").split("#", 1)[0]
         r = sess.get(url_extrato_clean, timeout=45, allow_redirects=True)
         if r.status_code != 200:
@@ -895,42 +875,28 @@ def extrato_produto(
             raise HTTPException(status_code=400, detail="Nenhuma chave NFe (44 dígitos) encontrada no extrato.jsp.")
 
         chave_alvo = (chave or "").strip() or chaves[0]
-
-        # 2) capa internamento
         url_capa = _montar_url_capa_internamento(usuario=usuario, chave=chave_alvo, token=token)
+
         r2 = sess.get(url_capa, timeout=60, allow_redirects=True)
         if r2.status_code != 200:
-            raise HTTPException(status_code=400, detail=f"Falha ao abrir internamento (capa): HTTP {r2.status_code}")
+            raise HTTPException(status_code=400, detail=f"Falha ao abrir internamento: HTTP {r2.status_code}")
 
         html_intern = r2.text
         final_url = r2.url
 
-        # 3) se a capa embutir link do /processamentos/show, abre ele (onde as tabelas estão)
-        show_url = None
-        if "/processamentos/show" in (final_url or ""):
-            show_url = final_url
-        else:
-            show_url = _resolve_processamentos_show_url(final_url or BASE_INTERNAMENTO, html_intern)
-
-        if show_url and "/processamentos/show" in show_url and show_url != final_url:
-            r3 = sess.get(show_url, timeout=60, allow_redirects=True)
-            if r3.status_code == 200:
-                html_intern = r3.text
-                final_url = r3.url
-
-        # 4) Itens da Nota
-        tab_itens, diag_itens = _find_table_itens_da_nota(html_intern)
+        # 1) Itens da Nota (NCM/CFOP/CEST/Produto SEFIN)
+        tab_itens, diag_itens = _pick_best_table(html_intern, _score_headers)
         itens_nota: List[Dict[str, Any]] = []
-        if tab_itens:
+        if tab_itens and (diag_itens.get("best_score", 0) >= 60):
             itens_nota = _parse_items_da_nota(tab_itens)
 
-        # 5) Cálculo Itens (CORRIGIDO: pega a tabela certa)
-        tab_calc, diag_calc = _find_table_calculo_itens(html_intern)
+        # 2) Cálculo Itens (Val. a Recolher.)  ✅ agora parse robusto
+        tab_calc, diag_calc = _pick_best_table(html_intern, _score_headers_calculo)
         calc_itens: List[Dict[str, Any]] = []
-        if tab_calc:
+        if tab_calc and (diag_calc.get("best_score", 0) >= 80):
             calc_itens = _parse_calculo_itens(tab_calc)
 
-        # 6) Merge
+        # 3) Merge
         itens_mesclados, diag_merge = _merge_itens_com_calculo(itens_nota, calc_itens)
 
         return {
