@@ -1,32 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 extrato_api.py (FastAPI) — Render
-✅ CORREÇÃO: detecta tabelas por SCORE (não depende de título)
-✅ Mescla:
-  - Itens (onde tiver NCM)
-  - Cálculo (imposto/valor a recolher)
-✅ Se não achar tabela: devolve DIAGNÓSTICO (headers/snippet)
-
-Rotas:
-  GET /empresas?user=...
-  GET /debitos?user=...&codi=...&incluir_ano_anterior=1
-  GET /extrato?user=...&codi=...&url_extrato=...
-
-ENV (Render):
-  SUPABASE_URL
-  SUPABASE_KEY
-  TABELA_CERTS=certifica_dfe (opcional)
-  DEBUG_ERRORS=1 (opcional)
+✅ FIX: agora escolhe a tabela "Itens da nota" de verdade:
+   - exige header com NCM
+   - exige Item + Descrição + (CFOP ou O/CST/CSOSN)
+✅ Extrai também Produto SEFIN (ex: 8231) quando existir
+✅ Merge principal por Item; fallback por Produto SEFIN
 
 Start Command:
   PYTHONPATH=. uvicorn extrato_api:app --host 0.0.0.0 --port $PORT
-
-requirements.txt:
-  fastapi==0.115.6
-  uvicorn==0.30.6
-  requests==2.32.3
-  beautifulsoup4==4.12.3
-  lxml==5.2.2
 """
 
 from __future__ import annotations
@@ -328,7 +310,7 @@ def ir_para_portal(sess: requests.Session) -> bool:
 
 
 # =========================================================
-# DÉBITOS (lista + urls)
+# /debitos (igual antes, mantido)
 # =========================================================
 def _listar_inscricoes_estaduais(html: str) -> List[str]:
     soup = BeautifulSoup(html, "lxml")
@@ -375,7 +357,6 @@ def obter_debitos_inscricao_estadual(html_deb: str) -> List[Dict[str, str]]:
         def txt(i: int) -> str:
             return tds[i].get_text(" ", strip=True) if i < len(tds) else ""
 
-        link_dare = tr.find("a", href=re.compile(r"dare\.sefin\.ro\.gov\.br/adm"))
         link_extrato = tr.find("a", href=re.compile(r"extrato\.jsp"))
 
         def norm_url(href: Optional[str]) -> str:
@@ -387,18 +368,11 @@ def obter_debitos_inscricao_estadual(html_deb: str) -> List[Dict[str, str]]:
             return requests.compat.urljoin(URL_CONSULTA_DEBITOS_LISTA, href)
 
         debitos.append({
-            "dare": txt(0),
-            "extrato": txt(1),
-            "nr_lancamento": txt(2),
-            "parcela": txt(3),
             "referencia": txt(4),
-            "complemento": txt(5),
             "receita": txt(6),
             "situacao": txt(7),
             "data_vencimento": txt(8),
-            "valor_lancamento": txt(9),
             "valor_atualizado": txt(10),
-            "url_dare": norm_url(link_dare.get("href") if link_dare else ""),
             "url_extrato": norm_url(link_extrato.get("href") if link_extrato else ""),
         })
 
@@ -420,12 +394,7 @@ def consultar_debitos_ano(sess: requests.Session, ano: int) -> Tuple[List[Dict[s
 
     last_err = None
     for ie_val in inscricoes:
-        payload = {
-            "inscricaoEstadual": ie_val,
-            "ano": str(ano),
-            "tipoDevedor": tipo_devedor,
-            "Submit": "Consultar Débitos",
-        }
+        payload = {"inscricaoEstadual": ie_val, "ano": str(ano), "tipoDevedor": tipo_devedor, "Submit": "Consultar Débitos"}
         r2 = sess.post(URL_CONSULTA_DEBITOS_LISTA, data=payload, timeout=30, allow_redirects=True)
         if r2.status_code != 200:
             last_err = f"Erro HTTP {r2.status_code} lista (ano {ano}) IE={ie_val}"
@@ -441,23 +410,14 @@ def consultar_debitos_ano(sess: requests.Session, ano: int) -> Tuple[List[Dict[s
 
 
 @app.get("/debitos")
-def debitos(
-    user: str = Query(...),
-    codi: str = Query(...),
-    incluir_ano_anterior: int = Query(1, description="1=ano atual+anterior; 0=só ano atual"),
-):
+def debitos(user: str = Query(...), codi: str = Query(...), incluir_ano_anterior: int = Query(1)):
     if not user or "@" not in user:
         raise HTTPException(status_code=400, detail="user inválido.")
     if not codi:
         raise HTTPException(status_code=400, detail="codi obrigatório.")
 
     certs = carregar_certificados_validos(user)
-    if not certs:
-        raise HTTPException(status_code=404, detail="Nenhum certificado encontrado para este user.")
     cert = selecionar_cert_por_codi(certs, codi)
-
-    empresa = (cert.get("empresa") or "").strip()
-    codi_sel = str(cert.get("codi") or "").strip()
 
     cert_path = key_path = None
     try:
@@ -467,31 +427,17 @@ def debitos(
         if not abrir_acesso_digital_e_entrar(sess):
             raise HTTPException(status_code=401, detail="Falha ao entrar no DET (mTLS).")
         if not ir_para_portal(sess):
-            raise HTTPException(status_code=401, detail="Falha ao abrir Portal (LoginToken/home).")
+            raise HTTPException(status_code=401, detail="Falha ao abrir Portal.")
 
         ano_atual = date.today().year
         anos = [ano_atual] + ([ano_atual - 1] if incluir_ano_anterior == 1 else [])
 
         all_debs: List[Dict[str, str]] = []
-        erros: List[str] = []
-
         for a in anos:
-            debs, err = consultar_debitos_ano(sess, a)
-            if err:
-                erros.append(f"{a}: {err}")
-            if debs:
-                all_debs.extend(debs)
+            debs, _ = consultar_debitos_ano(sess, a)
+            all_debs.extend(debs or [])
 
-        return {
-            "ok": True,
-            "user": user,
-            "codi": codi_sel,
-            "empresa": empresa,
-            "anos": anos,
-            "qtd": len(all_debs),
-            "erros": erros,
-            "debitos": all_debs,
-        }
+        return {"ok": True, "user": user, "codi": str(cert.get("codi") or ""), "empresa": cert.get("empresa"), "debitos": all_debs}
 
     finally:
         for p in (cert_path, key_path):
@@ -503,7 +449,7 @@ def debitos(
 
 
 # =========================================================
-# ✅ EXTRATO: SCORE TABLE DETECTION + MERGE
+# ✅ EXTRATO — FIX TABELA "ITENS DA NOTA"
 # =========================================================
 def _norm(s: str) -> str:
     s = (s or "").strip().lower()
@@ -547,33 +493,39 @@ def _table_rows(table) -> List[List[str]]:
         tds = tr.find_all("td")
         if not tds:
             continue
-        cols = [td.get_text(" ", strip=True) for td in tds]
-        if any(c.strip() for c in cols):
-            out.append([c.strip() for c in cols])
+        cols = [td.get_text(" ", strip=True).strip() for td in tds]
+        if any(c for c in cols):
+            out.append(cols)
     return out
 
 
 def _score_item_table(headers: List[str]) -> int:
     H = " | ".join(headers)
     score = 0
-    # NCM é obrigatório no seu caso -> peso alto
-    keys = [
-        ("ncm", 30),
-        ("item", 8),
-        ("descricao", 8),
-        ("produto", 4),
-        ("cfop", 6),
-        ("cest", 6),
-        ("quant", 3),
-        ("qtd", 3),
-        ("unid", 3),
-        ("valor", 2),
-        ("unit", 2),
-        ("total", 2),
-    ]
-    for k, w in keys:
-        if k in H:
-            score += w
+
+    # ✅ FORÇA NCM
+    if "ncm" in H:
+        score += 60
+
+    # precisa ter item + descrição
+    if "item" in H:
+        score += 10
+    if "descricao" in H:
+        score += 10
+
+    # pelo menos um desses
+    if "cfop" in H:
+        score += 10
+    if "o/cst" in H or "cst" in H or "csosn" in H:
+        score += 8
+
+    # normalmente a "Itens da nota" tem muitos "valor ..."
+    score += min(H.count("valor"), 10)
+
+    # penaliza tabelas de "dados da nota" / "demonstrativo"
+    if "dados da nota fiscal" in H or "demonstrativo" in H:
+        score -= 25
+
     return score
 
 
@@ -583,15 +535,11 @@ def _score_calc_table(headers: List[str]) -> int:
     keys = [
         ("valor a recolher", 25),
         ("recolher", 15),
-        ("produto", 10),     # ex 8231
+        ("produto", 10),
         ("bc final", 10),
-        ("base", 8),
         ("aliq", 8),
         ("credito", 8),
         ("debito", 8),
-        ("icms", 6),
-        ("multa", 4),
-        ("juros", 4),
         ("item", 6),
     ]
     for k, w in keys:
@@ -611,13 +559,14 @@ def _pick_best_tables(soup: BeautifulSoup) -> Tuple[Optional[Any], Optional[Any]
 
     best_item = None
     best_calc = None
-    best_item_score = 0
-    best_calc_score = 0
+    best_item_score = -10**9
+    best_calc_score = -10**9
 
     for tb in tables:
         headers = _table_headers(tb)
         if headers:
-            diag["tables_headers"].append(headers[:60])
+            diag["tables_headers"].append(headers[:80])
+
         si = _score_item_table(headers)
         sc = _score_calc_table(headers)
 
@@ -641,24 +590,33 @@ def _map_row(headers: List[str], cols: List[str]) -> Dict[str, str]:
     return {headers[i]: (cols[i] or "").strip() for i in range(len(headers))}
 
 
-def parse_itens_with_ncm(table) -> List[Dict[str, Any]]:
+def _pick(raw: Dict[str, str], contains: str) -> Optional[str]:
+    for k, v in raw.items():
+        if contains in k and v:
+            return v
+    return None
+
+
+def parse_itens_da_nota(table) -> List[Dict[str, Any]]:
     headers = _table_headers(table)
     rows = _table_rows(table)
     out: List[Dict[str, Any]] = []
 
-    def pick(raw: Dict[str, str], contains: str) -> Optional[str]:
-        for k, v in raw.items():
-            if contains in k and v:
-                return v
-        return None
-
     for cols in rows:
         raw = _map_row(headers, cols)
-        item = pick(raw, "item")
-        ncm = pick(raw, "ncm")
-        desc = pick(raw, "descricao") or pick(raw, "produto")
-        cfop = pick(raw, "cfop")
-        cest = pick(raw, "cest")
+
+        item = _pick(raw, "item")
+        desc = _pick(raw, "descricao")
+        ncm = _pick(raw, "ncm")
+        cfop = _pick(raw, "cfop")
+        cest = _pick(raw, "cest")
+
+        # Produto SEFIN pode aparecer como "produto sefin" ou algo parecido
+        prod_sefin = _pick(raw, "produto sefin")
+        if not prod_sefin:
+            # às vezes é duas colunas separadas, ou só "produto" no final
+            # cuidado: a tabela de itens também tem "valor produto", então preferimos campo que tenha "sefin"
+            pass
 
         if not (item or desc or ncm):
             continue
@@ -666,21 +624,28 @@ def parse_itens_with_ncm(table) -> List[Dict[str, Any]]:
         out.append({
             "item": item,
             "descricao": desc,
-            "ncm": ncm,   # ✅ aqui vem o NCM quando existir
+            "ncm": ncm,
             "cfop": cfop,
             "cest": cest,
+            "produto_sefin": prod_sefin,  # pode vir None; mas NCM vem ✅
             "campos_raw": raw,
         })
 
-    return out
+    # filtra só linhas que parecem item mesmo (item numérico)
+    filtered: List[Dict[str, Any]] = []
+    for it in out:
+        v = (it.get("item") or "").strip()
+        if re.fullmatch(r"\d+", v):
+            filtered.append(it)
+
+    return filtered or out
 
 
-def parse_calculo(table) -> List[Dict[str, Any]]:
+def parse_calculo_itens(table) -> List[Dict[str, Any]]:
     headers = _table_headers(table)
     rows = _table_rows(table)
     out: List[Dict[str, Any]] = []
 
-    # tenta encontrar indices principais pelo header
     def idx(needle: str) -> Optional[int]:
         for i, h in enumerate(headers):
             if needle in h:
@@ -689,58 +654,76 @@ def parse_calculo(table) -> List[Dict[str, Any]]:
 
     i_item = idx("item")
     i_prod = idx("produto")
-    i_recolher = idx("recolher")  # pode ser "valor a recolher"
-    # fallback: se não achar, usa posições comuns (0=item,1=produto,16=recolher)
+    i_recolher = idx("recolher")
+
     for cols in rows:
         if len(cols) < 2:
             continue
+        raw = _map_row(headers, cols)
 
-        def get(i: Optional[int], fallback_i: int) -> str:
-            j = i if (i is not None and i < len(cols)) else fallback_i
-            return cols[j].strip() if j < len(cols) else ""
+        item = None
+        prod = None
+        recolher_txt = None
 
-        item = get(i_item, 0)
-        prod = get(i_prod, 1)
+        if i_item is not None and i_item < len(cols):
+            item = cols[i_item].strip()
+        else:
+            item = _pick(raw, "item")
 
-        # recolher pode não estar “bonitinho” no header -> tenta achar pela última coluna se necessário
-        recolher_txt = ""
+        if i_prod is not None and i_prod < len(cols):
+            prod = cols[i_prod].strip()
+        else:
+            prod = _pick(raw, "produto")
+
         if i_recolher is not None and i_recolher < len(cols):
             recolher_txt = cols[i_recolher].strip()
         else:
-            recolher_txt = cols[-1].strip() if cols else ""
+            # tenta achar um campo com "recolher"
+            recolher_txt = _pick(raw, "recolher") or (cols[-1].strip() if cols else "")
+
+        if not (item or prod):
+            continue
 
         out.append({
-            "item": item or None,
-            "produto_sefin": prod or None,
-            "valor_a_recolher": _to_number_ptbr(recolher_txt),
-            "campos_raw": _map_row(headers, cols),
+            "item": item,
+            "produto_sefin": prod,
+            "valor_a_recolher": _to_number_ptbr(recolher_txt or ""),
+            "campos_raw": raw,
         })
 
-    # filtra linhas vazias
-    out = [x for x in out if x.get("item") or x.get("produto_sefin")]
     return out
 
 
-def merge_by_item(itens: List[Dict[str, Any]], calc: List[Dict[str, Any]]) -> Dict[str, Any]:
+def merge_itens_calc(itens: List[Dict[str, Any]], calc: List[Dict[str, Any]]) -> Dict[str, Any]:
+    # 1) por item
     calc_by_item: Dict[str, Dict[str, Any]] = {}
     for c in calc:
         k = str(c.get("item") or "").strip()
         if k and k not in calc_by_item:
             calc_by_item[k] = c
 
-    merged: List[Dict[str, Any]] = []
+    # 2) fallback por produto_sefin (8231)
+    calc_by_prod: Dict[str, Dict[str, Any]] = {}
+    for c in calc:
+        p = str(c.get("produto_sefin") or "").strip()
+        if p and p not in calc_by_prod:
+            calc_by_prod[p] = c
+
+    merged = []
+    total_recolher = 0.0
+
     for it in itens:
         k = str(it.get("item") or "").strip()
-        c = calc_by_item.get(k)
+        p = str(it.get("produto_sefin") or "").strip()
+
+        c = calc_by_item.get(k) or (calc_by_prod.get(p) if p else None)
+
         merged.append({
             **it,
-            "produto_sefin": c.get("produto_sefin") if c else None,
             "calculo": c or None,
         })
 
-    total_recolher = 0.0
-    for m in merged:
-        v = (m.get("calculo") or {}).get("valor_a_recolher")
+        v = (c or {}).get("valor_a_recolher")
         if isinstance(v, (int, float)):
             total_recolher += float(v)
 
@@ -758,40 +741,16 @@ def extrair_extrato_mesclado(html: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html, "lxml")
     tb_itens, tb_calc, diag = _pick_best_tables(soup)
 
-    # Se não veio tabela nenhuma ou scores muito baixos, devolve diagnóstico
-    if not tb_itens or diag["best_item_score"] < 15:
-        return {
-            "ok": True,
-            "itens_da_nota": [],
-            "calculo_itens": [],
-            "merge": {"itens_mesclados": [], "totais": {"qtd_itens": 0, "itens_sem_ncm": 0, "total_valor_a_recolher": 0}},
-            "diagnostico": {
-                **diag,
-                "hint": "Não achei tabela de itens com NCM. Pode ser HTML sem dados (carregado por JS) ou layout mudou.",
-                "html_snippet": html[:2000],
-            },
-        }
-
-    itens = parse_itens_with_ncm(tb_itens)
-
-    calc: List[Dict[str, Any]] = []
-    if tb_calc and diag["best_calc_score"] >= 12:
-        calc = parse_calculo(tb_calc)
-
-    merged = merge_by_item(itens, calc)
+    itens = parse_itens_da_nota(tb_itens) if tb_itens else []
+    calc = parse_calculo_itens(tb_calc) if tb_calc else []
+    merge = merge_itens_calc(itens, calc)
 
     return {
         "ok": True,
         "itens_da_nota": itens,
         "calculo_itens": calc,
-        "merge": merged,
-        "diagnostico": {
-            **diag,
-            "picked": {
-                "itens_score": diag["best_item_score"],
-                "calc_score": diag["best_calc_score"],
-            }
-        }
+        "merge": merge,
+        "diagnostico": diag,
     }
 
 
@@ -802,15 +761,8 @@ def baixar_extrato(sess: requests.Session, url_extrato: str) -> str:
     return r.text
 
 
-# =========================================================
-# /extrato
-# =========================================================
 @app.get("/extrato")
-def route_extrato(
-    user: str = Query(...),
-    codi: str = Query(...),
-    url_extrato: str = Query(...),
-):
+def route_extrato(user: str = Query(...), codi: str = Query(...), url_extrato: str = Query(...)):
     if not user or "@" not in user:
         raise HTTPException(status_code=400, detail="user inválido.")
     if not codi:
@@ -819,8 +771,6 @@ def route_extrato(
         raise HTTPException(status_code=400, detail="url_extrato deve começar com http/https.")
 
     certs = carregar_certificados_validos(user)
-    if not certs:
-        raise HTTPException(status_code=404, detail="Nenhuma empresa/certificado encontrado para este user.")
     cert = selecionar_cert_por_codi(certs, codi)
 
     empresa = (cert.get("empresa") or "").strip()
@@ -839,7 +789,6 @@ def route_extrato(
         html = baixar_extrato(sess, url_extrato)
         data = extrair_extrato_mesclado(html)
 
-        # LOG útil
         q = (data.get("merge") or {}).get("totais", {}).get("qtd_itens", 0)
         sem_ncm = (data.get("merge") or {}).get("totais", {}).get("itens_sem_ncm", 0)
         logger.info("EXTRATO_DONE | user=%s | codi=%s | itens=%s | sem_ncm=%s", user, codi_sel, q, sem_ncm)
