@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 analise.py — FastAPI (Render)
+
 ✅ Rotas:
   GET /health
   GET /empresas?user=...
@@ -9,10 +10,15 @@ analise.py — FastAPI (Render)
 
 ✅ Login: DET → Portal usando mTLS (cert pem/key do Supabase)
 
-✅ ALTERAÇÃO PEDIDA (AGORA):
-  - /extrato-produto retorna SOMENTE a PRIMEIRA tabela (table#itens_lancamentos)
-  - E corta ATÉ a coluna 10 (primeiras 10 colunas), incluindo headers e linhas.
-  - NÃO traz mais "itens_nota", "calculo_itens" nem merge.
+🔧 ALTERAÇÃO (somente):
+  - /extrato-produto agora retorna APENAS a tabela "Itens da nota"
+  - E corta em 10 colunas (até "Valor Base Calc. ICMS", que é a 10ª coluna no seu HTML)
+  - Não retorna mais cálculo, nem merge, nem itens_lancamentos.
+
+Obs.: No seu HTML, a seção existe como:
+  <h4 class="table-title"> Itens da nota</h4>
+  ... <table> ... (com as colunas)
+e a 10ª coluna é "Valor Base Calc. ICMS" :contentReference[oaicite:0]{index=0}
 """
 
 from __future__ import annotations
@@ -332,90 +338,125 @@ def _url_capa_internamento(usuario: str, chave: str, token: Optional[str]) -> st
 
 
 # ══════════════════════════════════════════════════════════════════
-# PARSER: SOMENTE PRIMEIRA TABELA (itens_lancamentos) ATÉ COLUNA 10
+# PARSER: SOMENTE "ITENS DA NOTA" (10 colunas)
 # ══════════════════════════════════════════════════════════════════
-def _table_headers(table: Tag) -> List[str]:
-    return [th.get_text(" ", strip=True) for th in table.find_all("th")]
+def _norm_text(text: str) -> str:
+    t = re.sub(r"\s+", " ", (text or "").strip().lower())
+    for src, dst in [
+        ("á","a"),("à","a"),("â","a"),("ã","a"),
+        ("é","e"),("ê","e"),("è","e"),
+        ("í","i"),("î","i"),
+        ("ó","o"),("ô","o"),("õ","o"),
+        ("ú","u"),("û","u"),
+        ("ç","c"),
+    ]:
+        t = t.replace(src, dst)
+    return t
 
 
-def _parse_primeira_tabela_ate_col10(soup: BeautifulSoup) -> Dict[str, Any]:
+def _limpar_header(h: str) -> str:
+    # deixa bonito (remove múltiplos espaços e tira "ou" quebrado)
+    h = re.sub(r"\s+", " ", (h or "").strip())
+    return h
+
+
+def _parse_itens_da_nota_primeiras_10_colunas(soup: BeautifulSoup) -> Dict[str, Any]:
     """
-    Pega SOMENTE table#itens_lancamentos (primeira tabela)
-    e corta para as primeiras 10 colunas (0..9).
+    Localiza a seção "Itens da nota" e retorna somente as 10 primeiras colunas:
+      1 Item
+      2 Descrição
+      3 O/CST ou O/CSOSN
+      4 CFOP
+      5 CEST
+      6 NCM
+      7 Valor Base Calc. ST
+      8 Valor ICMS ST
+      9 Valor ICMS UF Dest.
+     10 Valor Base Calc. ICMS
+    (No seu HTML isso aparece exatamente no thead) :contentReference[oaicite:1]{index=1}
     """
-    table = soup.find("table", {"id": "itens_lancamentos"})
-    if not table:
+    # acha o H4 da seção
+    h4 = None
+    for x in soup.find_all(["h4", "h3", "h2"]):
+        if "itens da nota" in _norm_text(x.get_text(" ", strip=True)):
+            h4 = x
+            break
+
+    if not h4:
         return {
-            "encontrada": False,
-            "motivo": "tabela id=itens_lancamentos nao existe",
+            "tabela_encontrada": False,
+            "motivo": "heading 'Itens da nota' nao encontrado",
             "headers": [],
-            "rows": [],
+            "itens": [],
+            "totais": {"qtd_linhas": 0, "qtd_colunas": 0},
+            "diagnostico": {"headers_full_n": 0, "headers_cut_n": 0},
         }
 
-    headers_full = _table_headers(table)
-    headers = headers_full[:10]
+    table = h4.find_next("table")
+    if not table:
+        return {
+            "tabela_encontrada": False,
+            "motivo": "table apos heading 'Itens da nota' nao encontrada",
+            "headers": [],
+            "itens": [],
+            "totais": {"qtd_linhas": 0, "qtd_colunas": 0},
+            "diagnostico": {"headers_full_n": 0, "headers_cut_n": 0},
+        }
 
-    rows: List[Dict[str, Any]] = []
+    ths = table.find_all("th")
+    headers_full = [_limpar_header(th.get_text(" ", strip=True)) for th in ths]
+    headers_cut = headers_full[:10]
+
+    itens: List[Dict[str, Any]] = []
     for tr in table.find_all("tr"):
         tds = tr.find_all("td")
         if not tds:
             continue
         cols_full = [td.get_text(" ", strip=True) for td in tds]
-        cols = cols_full[:10]
-
-        # ignora linha vazia
-        if not any((c or "").strip() for c in cols):
+        if len(cols_full) < 2:
             continue
 
-        # monta objeto por header (quando existir), e guarda cols_raw
-        obj: Dict[str, Any] = {"cols_raw": cols}
-        for i, h in enumerate(headers):
-            key = (h or f"col_{i+1}").strip() or f"col_{i+1}"
-            obj[key] = cols[i] if i < len(cols) else None
+        cols_cut = cols_full[:10]
 
-        # mantém atributos úteis se existirem
-        if tr.get("data-tipo1") is not None:
-            obj["_data_tipo1"] = tr.get("data-tipo1")
-        if tr.get("data-tipo2") is not None:
-            obj["_data_tipo2"] = tr.get("data-tipo2")
+        # valida linha: primeiro campo precisa ser item numérico
+        item0 = (cols_cut[0].strip() if cols_cut else "")
+        if not re.fullmatch(r"\d+", item0 or ""):
+            continue
 
-        rows.append(obj)
+        row = {"cols_raw": cols_cut}
+        for i, h in enumerate(headers_cut):
+            if i < len(cols_cut):
+                row[h] = cols_cut[i].strip() or None
+            else:
+                row[h] = None
+
+        itens.append(row)
 
     return {
-        "encontrada": True,
-        "headers": headers,
-        "headers_full_n": len(headers_full),
-        "headers_cut_n": len(headers),
-        "rows_count": len(rows),
-        "rows": rows,
+        "tabela_encontrada": True,
+        "motivo": None,
+        "headers": headers_cut,
+        "itens": itens,
+        "totais": {
+            "qtd_linhas": len(itens),
+            "qtd_colunas": len(headers_cut),
+        },
+        "diagnostico": {
+            "headers_full_n": len(headers_full),
+            "headers_cut_n": len(headers_cut),
+        },
     }
 
 
 def parse_internamento(html_intern: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html_intern, "lxml")
-    tab = _parse_primeira_tabela_ate_col10(soup)
-
-    return {
-        "itens_lancamentos": tab.get("rows", []),
-        "headers": tab.get("headers", []),
-        "totais": {
-            "tabela_encontrada": bool(tab.get("encontrada")),
-            "qtd_linhas": int(tab.get("rows_count") or 0),
-            "qtd_colunas": int(tab.get("headers_cut_n") or 0),
-        },
-        "diagnostico": {
-            "encontrada": tab.get("encontrada"),
-            "motivo": tab.get("motivo"),
-            "headers_full_n": tab.get("headers_full_n"),
-            "headers_cut_n": tab.get("headers_cut_n"),
-        },
-    }
+    return _parse_itens_da_nota_primeiras_10_colunas(soup)
 
 
 # ══════════════════════════════════════════════════════════════════
 # APP FASTAPI
 # ══════════════════════════════════════════════════════════════════
-app = FastAPI(title="analise — Débitos + Extrato (somente primeira tabela até coluna 10)")
+app = FastAPI(title="analise — Débitos + Extrato (Somente Itens da nota: 10 colunas)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -584,6 +625,7 @@ def extrato_produto(
 
         parsed = parse_internamento(r2.text)
 
+        # 🔥 retorno agora só com a tabela "Itens da nota" (10 colunas)
         return {
             "ok":      True,
             "user":    user,
@@ -595,7 +637,7 @@ def extrato_produto(
                 "token_found": bool(token),
                 "usuario":     usuario,
                 "chave":       chave_alvo,
-                **parsed,  # ✅ somente primeira tabela até coluna 10
+                **parsed,
             },
         }
 
