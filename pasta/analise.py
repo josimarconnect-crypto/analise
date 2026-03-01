@@ -9,11 +9,14 @@ analise.py — FastAPI (Render)
 
 ✅ Login: DET → Portal usando mTLS (cert pem/key do Supabase)
 
-✅ /extrato-produto:
+✅ /extrato-produto (NOVA SAÍDA):
   - Abre extrato.jsp, extrai TOKEN + USUARIO e CHAVE (se houver)
   - Abre internamento (capa_internamentos)
-  - Extrai SOMENTE a última tabela de "Cálculo Itens" (a do container correto)
-  - Retorna JSON enxuto com apenas "calculo_itens" + totais/diagnóstico
+  - Extrai APENAS a ÚLTIMA tabela de "Cálculo Itens" que contém "Val. a Recolher."
+  - Retorna somente:
+      result.calculo_itens (lista)
+      result.totais (qtd/colunas)
+      result.diagnostico (como achou a tabela)
 """
 
 from __future__ import annotations
@@ -41,7 +44,6 @@ import uvicorn
 # CONFIG
 # ══════════════════════════════════════════════════════════════════
 SUPABASE_URL  = os.getenv("SUPABASE_URL", "https://hysrxadnigzqadnlkynq.supabase.co").strip()
-# ⚠️ ideal: mover para ENV no Render
 SUPABASE_KEY  = os.getenv(
     "SUPABASE_KEY",
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA",
@@ -237,6 +239,7 @@ def obter_debitos_inscricao_estadual(html_deb: str) -> List[Dict[str, str]]:
             break
     if not tabela_alvo:
         return []
+
     linhas = tabela_alvo.find_all("tr")
     if len(linhas) <= 2:
         return []
@@ -334,7 +337,7 @@ def _url_capa_internamento(usuario: str, chave: str, token: Optional[str]) -> st
 
 
 # ══════════════════════════════════════════════════════════════════
-# PARSER DINÂMICO DE INTERNAMENTO
+# PARSER (SOMENTE ÚLTIMA TABELA DE CÁLCULO)
 # ══════════════════════════════════════════════════════════════════
 def _norm_text(text: str) -> str:
     """Lowercase + sem acentos + espaço único."""
@@ -355,38 +358,6 @@ def _table_headers(table: Tag) -> List[str]:
     return [th.get_text(" ", strip=True) for th in table.find_all("th")]
 
 
-def _table_data_rows(table: Tag) -> List[List[str]]:
-    rows = []
-    for tr in table.find_all("tr"):
-        tds = tr.find_all("td")
-        if tds:
-            rows.append([td.get_text(" ", strip=True) for td in tds])
-    return rows
-
-
-def _find_col_idx(norm_headers: List[str], *aliases: str) -> Optional[int]:
-    aliases_n = [_norm_text(a) for a in aliases]
-    for i, h in enumerate(norm_headers):
-        if any(a in h for a in aliases_n):
-            return i
-    return None
-
-
-# ── Scorers ────────────────────────────────────────────────────────
-_SCORE_ITENS_KW: List[Tuple[str, int]] = [
-    ("ncm",              50),
-    ("cfop",             30),
-    ("cest",             20),
-    ("cst",              20),
-    ("csosn",            20),
-    ("o/cst",            20),
-    ("descricao",        15),
-    ("descr",            10),
-    ("item",             10),
-    ("valor produto",     5),
-    ("itens da nota",    60),
-]
-
 _SCORE_CALC_KW: List[Tuple[str, int]] = [
     ("val. mercadoria",        40),
     ("val. debito mercadoria", 40),
@@ -406,120 +377,41 @@ _SCORE_CALC_KW: List[Tuple[str, int]] = [
 ]
 
 
-def _score_table(table: Tag, keywords: List[Tuple[str, int]], bonus_if_n_headers: Optional[int] = None) -> int:
-    ths = _table_headers(table)
-    if not ths:
-        return 0
+def _score_calc_headers(ths: List[str]) -> int:
     joined = _norm_text(" | ".join(ths))
-    score = sum(pts for kw, pts in keywords if kw in joined)
-    if bonus_if_n_headers and len(ths) == bonus_if_n_headers:
+    score = sum(pts for kw, pts in _SCORE_CALC_KW if kw in joined)
+    if len(ths) == 17:
         score += 50
-    for row in _table_data_rows(table):
-        if len(row) >= 10 and re.fullmatch(r"\d+", row[0].strip()):
-            score += 5
     return score
 
 
-def _pick_best_table(
-    soup: BeautifulSoup,
-    keywords: List[Tuple[str, int]],
-    min_score: int = 30,
-    bonus_if_n_headers: Optional[int] = None,
-) -> Tuple[Optional[Tag], Dict[str, Any]]:
-    tables = soup.find_all("table")
-    best: Optional[Tag] = None
-    best_score = -1
-    scores = []
+def _is_valid_calc_table(t: Optional[Tag]) -> Tuple[bool, Dict[str, Any]]:
+    if not t:
+        return False, {"ok": False, "motivo": "tabela_none"}
 
-    for i, t in enumerate(tables):
-        sc = _score_table(t, keywords, bonus_if_n_headers)
-        ths = _table_headers(t)
-        data_count = len(_table_data_rows(t))
-        scores.append({"i": i, "score": sc, "headers": len(ths), "data_rows": data_count})
-        if sc > best_score:
-            best_score = sc
-            best = t
+    ths = _table_headers(t)
+    if not ths:
+        return False, {"ok": False, "motivo": "sem_th"}
 
-    diag = {"tables_found": len(tables), "best_score": best_score, "scores": scores}
-    return (best if best_score >= min_score else None), diag
+    joined = _norm_text(" | ".join(ths))
+    has_recolher = ("val. a recolher" in joined) or ("valor a recolher" in joined)
+    score = _score_calc_headers(ths)
 
+    ok = False
+    if len(ths) == 17 and has_recolher:
+        ok = True
+    elif score >= 120 and has_recolher:
+        ok = True
 
-# ──────────────────────────────────────────────────────────────────
-# FIX IMPORTANTE: localizar tabela de cálculo com validação
-# ──────────────────────────────────────────────────────────────────
-def _localizar_tabela_calculo(soup: BeautifulSoup, tab_itens_nota: Optional[Tag] = None) -> Tuple[Optional[Tag], str]:
-    """
-    Localiza a tabela de Cálculo Itens com estratégias em cascata,
-    MAS só aceita uma candidata se ela parecer mesmo tabela de cálculo:
-      - score alto pelos headers de cálculo
-      - ideal: 17 colunas
-      - não pode ser a mesma tabela de "Itens da Nota"
-    """
-
-    def _is_valid_calc_table(t: Optional[Tag]) -> bool:
-        if not t:
-            return False
-        if tab_itens_nota is not None and t == tab_itens_nota:
-            return False
-        ths = _table_headers(t)
-        if not ths:
-            return False
-
-        score = _score_table(t, _SCORE_CALC_KW, bonus_if_n_headers=17)
-        joined = _norm_text(" | ".join(ths))
-        has_recolher = ("val. a recolher" in joined) or ("valor a recolher" in joined)
-
-        if len(ths) == 17 and has_recolher:
-            return True
-        if score >= 120 and has_recolher:
-            return True
-        return False
-
-    # 1) ID direto do container (normalmente é a ÚLTIMA tabela de cálculo correta)
-    container = soup.find("div", {"id": "calculo-itens-container"})
-    if container:
-        t = container.find("table")
-        if _is_valid_calc_table(t):
-            return t, "id:calculo-itens-container"
-
-    # 2) Classe nos TRs de dados
-    rows = soup.find_all("tr", class_="itens-calculos-row")
-    if rows:
-        t = rows[0].find_parent("table")
-        if _is_valid_calc_table(t):
-            return t, "class:itens-calculos-row"
-
-    # 3) Heading "Cálculo Itens" (com validação)
-    for heading in soup.find_all(["h1", "h2", "h3", "h4", "h5"]):
-        txt = _norm_text(heading.get_text())
-        if "calculo itens" in txt or "calculo de itens" in txt:
-            for parent in heading.parents:
-                if parent.name in ("div", "section", "article"):
-                    t = parent.find("table")
-                    if _is_valid_calc_table(t):
-                        return t, "heading:parent(valid)"
-            t = heading.find_next("table")
-            if _is_valid_calc_table(t):
-                return t, "heading:next(valid)"
-
-    # 4) Scorer de headers (último recurso)
-    tables = soup.find_all("table")
-    best: Optional[Tag] = None
-    best_score = -1
-    for t in tables:
-        if tab_itens_nota is not None and t == tab_itens_nota:
-            continue
-        sc = _score_table(t, _SCORE_CALC_KW, bonus_if_n_headers=17)
-        if sc > best_score:
-            best_score = sc
-            best = t
-    if _is_valid_calc_table(best):
-        return best, f"scorer:score={best_score}"
-
-    return None, "nao_encontrada"
+    return ok, {
+        "ok": ok,
+        "n_headers": len(ths),
+        "has_recolher": has_recolher,
+        "score": score,
+        "headers_preview": ths[:6],
+    }
 
 
-# ── Parse: Cálculo Itens (dinâmico) ───────────────────────────────
 _CALC_COL_ALIASES: Dict[str, List[str]] = {
     "item":                   ["item"],
     "produto":                ["produto"],
@@ -561,13 +453,13 @@ def _build_calc_idx(header_cells: List[str]) -> Dict[str, Optional[int]]:
 def _parse_calculo_itens(table: Tag) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     all_tr = table.find_all("tr")
     if not all_tr:
-        return [], {"erro": "tabela vazia"}
+        return [], {"erro": "tabela_vazia"}
 
     header_cells: List[str] = []
     header_tr: Optional[Tag] = None
     for tr in all_tr[:12]:
         ths = tr.find_all("th")
-        if len(ths) >= 10:  # cálculo costuma ter 17 colunas
+        if len(ths) >= 10:
             header_cells = [th.get_text(" ", strip=True) for th in ths]
             header_tr = tr
             break
@@ -617,33 +509,73 @@ def _parse_calculo_itens(table: Tag) -> Tuple[List[Dict[str, Any]], Dict[str, An
     return out, diag
 
 
-# ── Entry point do parser (ALTERADO: retorna somente cálculo) ──────
+def _localizar_ultima_tabela_calculo(soup: BeautifulSoup) -> Tuple[Optional[Tag], Dict[str, Any]]:
+    """
+    Encontra TODAS as tabelas candidatas de cálculo e retorna a ÚLTIMA no DOM
+    que seja válida e contenha "Val. a Recolher".
+    """
+    tables = soup.find_all("table")
+    valid: List[Tag] = []
+    checks: List[Dict[str, Any]] = []
+
+    for i, t in enumerate(tables):
+        ok, info = _is_valid_calc_table(t)
+        info2 = {"i": i, **info}
+        checks.append(info2)
+        if ok:
+            valid.append(t)
+
+    if not valid:
+        return None, {
+            "estrategia": "ultima_validada",
+            "tables_found": len(tables),
+            "validas": 0,
+            "checks": checks,
+            "motivo": "nenhuma_tabela_calc_valida",
+        }
+
+    # ✅ pega a última válida no DOM
+    chosen = valid[-1]
+    # acha o índice dela para diagnóstico
+    chosen_index = None
+    for i, t in enumerate(tables):
+        if t == chosen:
+            chosen_index = i
+            break
+
+    ths = _table_headers(chosen)
+    return chosen, {
+        "estrategia": "ultima_validada",
+        "tables_found": len(tables),
+        "validas": len(valid),
+        "chosen_index": chosen_index,
+        "chosen_n_headers": len(ths),
+        "chosen_has_recolher": ("val. a recolher" in _norm_text(" | ".join(ths))),
+        "chosen_score": _score_calc_headers(ths),
+        "checks": checks,
+    }
+
+
 def parse_internamento(html_intern: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html_intern, "lxml")
 
-    # pega a tabela "itens da nota" apenas para evitar confundir com a de cálculo
-    tab_itens, diag_sel_itens = _pick_best_table(soup, _SCORE_ITENS_KW, min_score=50)
-
-    # calcula (a tabela correta, tipicamente dentro do div#calculo-itens-container)
-    tab_calc, estrategia_calc = _localizar_tabela_calculo(soup, tab_itens_nota=tab_itens)
+    tab_calc, diag_find = _localizar_ultima_tabela_calculo(soup)
 
     calc_itens: List[Dict[str, Any]] = []
-    diag_parse_calc: Dict[str, Any] = {"estrategia": estrategia_calc}
-
+    diag_parse: Dict[str, Any] = {}
     if tab_calc:
-        _linhas, _d = _parse_calculo_itens(tab_calc)
-        calc_itens = _linhas
-        diag_parse_calc.update(_d)
+        calc_itens, diag_parse = _parse_calculo_itens(tab_calc)
 
     return {
         "calculo_itens": calc_itens,
         "totais": {
             "qtd_itens_calculo": len(calc_itens),
-            "n_cols_calculo": diag_parse_calc.get("n_headers", 0),
+            "n_cols_calculo": diag_parse.get("n_headers", 0),
+            "itens_sem_valor_a_recolher": sum(1 for x in calc_itens if not x.get("valor_a_recolher")),
         },
         "diagnostico": {
-            "calculo_itens": diag_parse_calc,
-            "itens_da_nota_score": diag_sel_itens,  # opcional (se quiser super enxuto, pode remover)
+            "find_calculo": diag_find,
+            "parse_calculo": diag_parse,
         },
     }
 
@@ -651,7 +583,7 @@ def parse_internamento(html_intern: str) -> Dict[str, Any]:
 # ══════════════════════════════════════════════════════════════════
 # APP FASTAPI
 # ══════════════════════════════════════════════════════════════════
-app = FastAPI(title="analise — Débitos + Extrato por Produto (somente cálculo itens)")
+app = FastAPI(title="analise — Débitos + Extrato por Produto (somente última tabela de cálculo)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -818,7 +750,6 @@ def extrato_produto(
         if r2.status_code != 200:
             raise HTTPException(400, f"Falha ao abrir internamento: HTTP {r2.status_code}")
 
-        # ✅ ALTERAÇÃO: parser retorna somente a tabela de cálculo
         parsed = parse_internamento(r2.text)
 
         return {
@@ -832,9 +763,7 @@ def extrato_produto(
                 "token_found": bool(token),
                 "usuario":     usuario,
                 "chave":       chave_alvo,
-
-                # ✅ somente cálculo no JSON
-                **parsed,
+                **parsed,  # ✅ agora vem SOMENTE calculo_itens + totais + diagnostico
             },
         }
 
