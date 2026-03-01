@@ -12,18 +12,8 @@ analise.py — FastAPI (Render)
 ✅ /extrato-produto:
   - Abre extrato.jsp, extrai TOKEN + USUARIO e CHAVE (se houver)
   - Abre internamento (capa_internamentos)
-  - Extrai 3 tabelas (100% dinâmico):
-      • "Itens lançamentos" (table#itens_lancamentos) -> JSON separado
-      • "Itens da Nota" (score headers)               -> JSON separado
-      • "Cálculo Itens" (robusto)                     -> JSON separado
-  - Tenta mesclar no backend (por ITEM) em merged_by_item
-  - Retorna também as tabelas separadas para o HTML unir do jeito que quiser
-
-🔧 FIX desta versão (seu caso):
-  - Seu parser estava pegando a tabela errada no "Cálculo Itens" (acabava pegando a mesma de Itens da Nota),
-    por isso "valor_a_recolher" vinha null.
-  - Agora o localizador de cálculo VALIDA a tabela candidata pelo score/headers (17 colunas) antes de aceitar.
-  - Com isso, ele encontra a tabela correta que tem "Val. a Recolher." e preenche "valor_a_recolher".
+  - Extrai SOMENTE a última tabela de "Cálculo Itens" (a do container correto)
+  - Retorna JSON enxuto com apenas "calculo_itens" + totais/diagnóstico
 """
 
 from __future__ import annotations
@@ -382,61 +372,6 @@ def _find_col_idx(norm_headers: List[str], *aliases: str) -> Optional[int]:
     return None
 
 
-# ──────────────────────────────────────────────────────────────────
-# NOVO: parse da tabela "itens_lancamentos" (primeira tabela)
-# ──────────────────────────────────────────────────────────────────
-def _parse_itens_lancamentos(soup: BeautifulSoup) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    table = soup.find("table", {"id": "itens_lancamentos"})
-    if not table:
-        return [], {"encontrada": False, "motivo": "tabela id=itens_lancamentos nao existe"}
-
-    headers = [th.get_text(" ", strip=True) for th in table.find_all("th")]
-    hn = [_norm_text(h) for h in headers]
-
-    idx = {
-        "tipo":           _find_col_idx(hn, "tipo"),
-        "produto":        _find_col_idx(hn, "produto"),
-        "descricao":      _find_col_idx(hn, "descricao", "descrição", "descr"),
-        "valor_item":     _find_col_idx(hn, "valor item"),
-        "valor_debito":   _find_col_idx(hn, "valor debito", "valor débito"),
-        "valor_credito":  _find_col_idx(hn, "valor credito", "valor crédito"),
-        "valor_recolher": _find_col_idx(hn, "valor a recolher"),
-    }
-
-    def get(cols: List[str], key: str) -> Optional[str]:
-        i = idx.get(key)
-        if i is None or i < 0 or i >= len(cols):
-            return None
-        v = cols[i].strip()
-        return v or None
-
-    out: List[Dict[str, Any]] = []
-    for tr in table.find_all("tr"):
-        tds = tr.find_all("td")
-        if not tds:
-            continue
-        cols = [td.get_text(" ", strip=True) for td in tds]
-        if len(cols) < 3:
-            continue
-
-        row = {k: get(cols, k) for k in idx}
-        row["_data_tipo1"] = tr.get("data-tipo1")
-        row["_data_tipo2"] = tr.get("data-tipo2")
-
-        if not any([row.get("tipo"), row.get("produto"), row.get("descricao")]):
-            continue
-        out.append(row)
-
-    diag = {
-        "encontrada": True,
-        "headers_found": headers,
-        "n_headers": len(headers),
-        "col_map": idx,
-        "linhas_extraidas": len(out),
-    }
-    return out, diag
-
-
 # ── Scorers ────────────────────────────────────────────────────────
 _SCORE_ITENS_KW: List[Tuple[str, int]] = [
     ("ncm",              50),
@@ -455,7 +390,7 @@ _SCORE_ITENS_KW: List[Tuple[str, int]] = [
 _SCORE_CALC_KW: List[Tuple[str, int]] = [
     ("val. mercadoria",        40),
     ("val. debito mercadoria", 40),
-    ("val. a recolher",        60),  # ↑ deixa bem forte pra garantir pegar a tabela certa
+    ("val. a recolher",        60),
     ("base calc. final",       30),
     ("frete fob",              25),
     ("aliq. interna",          20),
@@ -478,7 +413,7 @@ def _score_table(table: Tag, keywords: List[Tuple[str, int]], bonus_if_n_headers
     joined = _norm_text(" | ".join(ths))
     score = sum(pts for kw, pts in keywords if kw in joined)
     if bonus_if_n_headers and len(ths) == bonus_if_n_headers:
-        score += 50  # ↑ mais bônus quando for 17 colunas (tabela de cálculo)
+        score += 50
     for row in _table_data_rows(table):
         if len(row) >= 10 and re.fullmatch(r"\d+", row[0].strip()):
             score += 5
@@ -531,7 +466,6 @@ def _localizar_tabela_calculo(soup: BeautifulSoup, tab_itens_nota: Optional[Tag]
             return False
 
         score = _score_table(t, _SCORE_CALC_KW, bonus_if_n_headers=17)
-        # Regras: ou tem 17 colunas OU score muito alto + contém "val a recolher"
         joined = _norm_text(" | ".join(ths))
         has_recolher = ("val. a recolher" in joined) or ("valor a recolher" in joined)
 
@@ -541,7 +475,7 @@ def _localizar_tabela_calculo(soup: BeautifulSoup, tab_itens_nota: Optional[Tag]
             return True
         return False
 
-    # 1) ID direto do container
+    # 1) ID direto do container (normalmente é a ÚLTIMA tabela de cálculo correta)
     container = soup.find("div", {"id": "calculo-itens-container"})
     if container:
         t = container.find("table")
@@ -555,22 +489,20 @@ def _localizar_tabela_calculo(soup: BeautifulSoup, tab_itens_nota: Optional[Tag]
         if _is_valid_calc_table(t):
             return t, "class:itens-calculos-row"
 
-    # 3) Heading "Cálculo Itens" (com validação!)
+    # 3) Heading "Cálculo Itens" (com validação)
     for heading in soup.find_all(["h1", "h2", "h3", "h4", "h5"]):
         txt = _norm_text(heading.get_text())
         if "calculo itens" in txt or "calculo de itens" in txt:
-            # tenta via parents
             for parent in heading.parents:
                 if parent.name in ("div", "section", "article"):
                     t = parent.find("table")
                     if _is_valid_calc_table(t):
                         return t, "heading:parent(valid)"
-            # próxima tabela no DOM
             t = heading.find_next("table")
             if _is_valid_calc_table(t):
                 return t, "heading:next(valid)"
 
-    # 4) Scorer de headers (último recurso) — escolhe a melhor e valida
+    # 4) Scorer de headers (último recurso)
     tables = soup.find_all("table")
     best: Optional[Tag] = None
     best_score = -1
@@ -585,93 +517,6 @@ def _localizar_tabela_calculo(soup: BeautifulSoup, tab_itens_nota: Optional[Tag]
         return best, f"scorer:score={best_score}"
 
     return None, "nao_encontrada"
-
-
-# ── Parse: Itens da Nota (dinâmico) ───────────────────────────────
-def _parse_itens_da_nota(table: Tag) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    all_tr = table.find_all("tr")
-
-    header_cells: List[str] = []
-    header_tr: Optional[Tag] = None
-    for tr in all_tr[:15]:
-        ths = tr.find_all("th")
-        if len(ths) >= 4:
-            header_cells = [th.get_text(" ", strip=True) for th in ths]
-            header_tr = tr
-            break
-    if not header_cells and all_tr:
-        cells = all_tr[0].find_all(["td", "th"])
-        header_cells = [c.get_text(" ", strip=True) for c in cells]
-        header_tr = all_tr[0]
-
-    hn = [_norm_text(h) for h in header_cells]
-
-    idx = {
-        "item":      _find_col_idx(hn, "item"),
-        "descricao": _find_col_idx(hn, "descricao", "descrição", "descr"),
-        "cst":       _find_col_idx(hn, "o/cst", "o/csosn", "cst", "csosn"),
-        "cfop":      _find_col_idx(hn, "cfop"),
-        "cest":      _find_col_idx(hn, "cest"),
-        "ncm":       _find_col_idx(hn, "ncm"),
-
-        "vbc_st":    _find_col_idx(hn, "valor base calc. st"),
-        "vicms_st":  _find_col_idx(hn, "valor icms st"),
-        "vicms_dest":_find_col_idx(hn, "valor icms uf dest"),
-        "vbc_icms":  _find_col_idx(hn, "valor base calc. icms"),
-        "aliq_icms": _find_col_idx(hn, "% aliq"),
-
-        "vicms":     _find_col_idx(hn, "valor icms", "valor icms sn"),
-        "vprod":     _find_col_idx(hn, "valor produto"),
-        "vdesc":     _find_col_idx(hn, "valor desconto"),
-        "vipi":      _find_col_idx(hn, "valor ipi"),
-        "vseg":      _find_col_idx(hn, "valor seguro"),
-        "voutro":    _find_col_idx(hn, "valor outros"),
-        "vfrete":    _find_col_idx(hn, "valor frete"),
-        "vsubtotal": _find_col_idx(hn, "valor sub total"),
-        "vicms_deson":_find_col_idx(hn, "valor icms desonerado"),
-        "vtotal":    _find_col_idx(hn, "valor total"),
-        "cls":       _find_col_idx(hn, "cls"),
-        "prod_sefin":_find_col_idx(hn, "produto sefin"),
-        "obs":       _find_col_idx(hn, "obs"),
-    }
-
-    def get(cols: List[str], key: str) -> Optional[str]:
-        i = idx.get(key)
-        if i is None or i < 0 or i >= len(cols):
-            return None
-        v = cols[i].strip()
-        return v or None
-
-    items: List[Dict[str, Any]] = []
-    for tr in all_tr:
-        if tr is header_tr:
-            continue
-        tds = tr.find_all("td")
-        if not tds:
-            continue
-        cols = [td.get_text(" ", strip=True) for td in tds]
-        if len(cols) < 2:
-            continue
-
-        item_str = get(cols, "item") or cols[0].strip()
-        if not item_str or not re.fullmatch(r"\d+", item_str.strip()):
-            continue
-
-        row: Dict[str, Any] = {k: get(cols, k) for k in idx}
-        row["item"] = item_str.strip()
-
-        if not any([row.get("descricao"), row.get("ncm"), row.get("cfop"), row.get("cst")]):
-            continue
-
-        items.append(row)
-
-    diag = {
-        "headers_found": header_cells,
-        "n_headers": len(header_cells),
-        "col_map": idx,
-        "items_extraidos": len(items),
-    }
-    return items, diag
 
 
 # ── Parse: Cálculo Itens (dinâmico) ───────────────────────────────
@@ -772,153 +617,33 @@ def _parse_calculo_itens(table: Tag) -> Tuple[List[Dict[str, Any]], Dict[str, An
     return out, diag
 
 
-# ── Merge consolidado (por ITEM) ──────────────────────────────────
-def _merge_itens(
-    itens_nota: List[Dict[str, Any]],
-    calculo:    List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    calc_by_item: Dict[str, Dict[str, Any]] = {}
-    for c in calculo or []:
-        k = str(c.get("item") or "").strip()
-        if k and k not in calc_by_item:
-            calc_by_item[k] = c
-
-    merged: List[Dict[str, Any]] = []
-    with_calc = 0
-
-    for it in itens_nota or []:
-        k = str(it.get("item") or "").strip()
-        c = calc_by_item.get(k)
-
-        row: Dict[str, Any] = {
-            "item":       k or None,
-            "descricao":  it.get("descricao"),
-            "cst":        it.get("cst"),
-            "cfop":       it.get("cfop"),
-            "cest":       it.get("cest"),
-            "ncm":        it.get("ncm"),
-
-            "vbc_st":     it.get("vbc_st"),
-            "vicms_st":   it.get("vicms_st"),
-            "vicms_dest": it.get("vicms_dest"),
-            "vbc_icms":   it.get("vbc_icms"),
-            "aliq_icms":  it.get("aliq_icms"),
-            "vicms":      it.get("vicms"),
-            "vprod":      it.get("vprod"),
-            "vdesc":      it.get("vdesc"),
-            "vipi":       it.get("vipi"),
-            "vseg":       it.get("vseg"),
-            "voutro":     it.get("voutro"),
-            "vfrete":     it.get("vfrete"),
-            "vsubtotal":  it.get("vsubtotal"),
-            "vicms_deson":it.get("vicms_deson"),
-            "vtotal":     it.get("vtotal"),
-            "cls":        it.get("cls"),
-            "prod_sefin": it.get("prod_sefin"),
-            "obs":        it.get("obs"),
-
-            "calc_produto":      None,
-            "calc_val_merc":     None,
-            "calc_perc_red":     None,
-            "calc_bc_merc":      None,
-            "calc_frete":        None,
-            "calc_bc_frete":     None,
-            "calc_bc_final":     None,
-            "calc_aliq_int":     None,
-            "calc_aliq_nfe":     None,
-            "calc_aliq_cte":     None,
-            "calc_deb_merc":     None,
-            "calc_deb_frete":    None,
-            "calc_cred_nfe":     None,
-            "calc_cred_cte":     None,
-            "calc_cred_compl":   None,
-            "calc_a_recolher":   None,  # ✅ este é o que você pediu
-        }
-
-        if c:
-            with_calc += 1
-            row.update({
-                "calc_produto":    c.get("produto"),
-                "calc_val_merc":   c.get("val_mercadoria"),
-                "calc_perc_red":   c.get("perc_reducao"),
-                "calc_bc_merc":    c.get("bc_mercadoria"),
-                "calc_frete":      c.get("frete_fob"),
-                "calc_bc_frete":   c.get("bc_frete"),
-                "calc_bc_final":   c.get("bc_final"),
-                "calc_aliq_int":   c.get("aliq_interna"),
-                "calc_aliq_nfe":   c.get("aliq_orig_nfe"),
-                "calc_aliq_cte":   c.get("aliq_orig_cte"),
-                "calc_deb_merc":   c.get("val_deb_mercadoria"),
-                "calc_deb_frete":  c.get("val_deb_frete"),
-                "calc_cred_nfe":   c.get("val_cred_nfe"),
-                "calc_cred_cte":   c.get("val_cred_cte"),
-                "calc_cred_compl": c.get("val_cred_complementar"),
-                "calc_a_recolher": c.get("valor_a_recolher"),  # ✅ aqui
-            })
-
-        merged.append(row)
-
-    diag = {
-        "itens_nota":        len(itens_nota or []),
-        "linhas_calculo":    len(calculo or []),
-        "itens_com_calculo": with_calc,
-        "itens_sem_calculo": len(itens_nota or []) - with_calc,
-    }
-    return merged, diag
-
-
-# ── Entry point do parser ──────────────────────────────────────────
+# ── Entry point do parser (ALTERADO: retorna somente cálculo) ──────
 def parse_internamento(html_intern: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html_intern, "lxml")
 
-    # 0) Primeira tabela (itens_lancamentos)
-    itens_lanc, diag_lanc = _parse_itens_lancamentos(soup)
-
-    # 1) Itens da Nota (tabela grande)
+    # pega a tabela "itens da nota" apenas para evitar confundir com a de cálculo
     tab_itens, diag_sel_itens = _pick_best_table(soup, _SCORE_ITENS_KW, min_score=50)
-    itens_nota: List[Dict[str, Any]] = []
-    diag_parse_itens: Dict[str, Any] = {}
-    if tab_itens:
-        itens_nota, diag_parse_itens = _parse_itens_da_nota(tab_itens)
 
-    # 2) Cálculo Itens (agora com validação pra não pegar a tabela errada)
+    # calcula (a tabela correta, tipicamente dentro do div#calculo-itens-container)
     tab_calc, estrategia_calc = _localizar_tabela_calculo(soup, tab_itens_nota=tab_itens)
+
     calc_itens: List[Dict[str, Any]] = []
     diag_parse_calc: Dict[str, Any] = {"estrategia": estrategia_calc}
+
     if tab_calc:
         _linhas, _d = _parse_calculo_itens(tab_calc)
         calc_itens = _linhas
         diag_parse_calc.update(_d)
 
-    # 3) Merge backend por ITEM
-    itens_consolidados, diag_merge = _merge_itens(itens_nota, calc_itens)
-
     return {
-        "tables": {
-            "itens_lancamentos": itens_lanc,
-            "itens_nota": itens_nota,
-            "calculo_itens": calc_itens,
-        },
-        "merged_by_item": itens_consolidados,
+        "calculo_itens": calc_itens,
         "totais": {
-            "qtd_itens_merge":       len(itens_consolidados),
-            "qtd_itens_nota":        len(itens_nota),
-            "qtd_itens_calculo":     len(calc_itens),
-            "qtd_itens_lancamentos": len(itens_lanc),
-
-            "n_cols_itens_nota":     diag_parse_itens.get("n_headers", 0),
-            "n_cols_calculo":        diag_parse_calc.get("n_headers", 0),
-
-            "itens_com_calculo":     diag_merge.get("itens_com_calculo", 0),
-            "itens_sem_calculo":     diag_merge.get("itens_sem_calculo", 0),
-            "itens_sem_ncm":         sum(1 for x in itens_consolidados if not x.get("ncm")),
-            "itens_sem_valor_a_recolher": sum(1 for x in itens_consolidados if not x.get("calc_a_recolher")),
+            "qtd_itens_calculo": len(calc_itens),
+            "n_cols_calculo": diag_parse_calc.get("n_headers", 0),
         },
         "diagnostico": {
-            "itens_lancamentos": diag_lanc,
-            "itens_da_nota": {**diag_sel_itens, "parse": diag_parse_itens},
             "calculo_itens": diag_parse_calc,
-            "merge": diag_merge,
+            "itens_da_nota_score": diag_sel_itens,  # opcional (se quiser super enxuto, pode remover)
         },
     }
 
@@ -926,7 +651,7 @@ def parse_internamento(html_intern: str) -> Dict[str, Any]:
 # ══════════════════════════════════════════════════════════════════
 # APP FASTAPI
 # ══════════════════════════════════════════════════════════════════
-app = FastAPI(title="analise — Débitos + Extrato por Produto (3 tabelas + merge opcional)")
+app = FastAPI(title="analise — Débitos + Extrato por Produto (somente cálculo itens)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1093,6 +818,7 @@ def extrato_produto(
         if r2.status_code != 200:
             raise HTTPException(400, f"Falha ao abrir internamento: HTTP {r2.status_code}")
 
+        # ✅ ALTERAÇÃO: parser retorna somente a tabela de cálculo
         parsed = parse_internamento(r2.text)
 
         return {
@@ -1106,6 +832,8 @@ def extrato_produto(
                 "token_found": bool(token),
                 "usuario":     usuario,
                 "chave":       chave_alvo,
+
+                # ✅ somente cálculo no JSON
                 **parsed,
             },
         }
