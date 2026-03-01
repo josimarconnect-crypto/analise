@@ -12,10 +12,12 @@ analise.py — FastAPI (Render)
 ✅ /extrato-produto:
   - Abre extrato.jsp, extrai TOKEN + USUARIO e CHAVE (se houver)
   - Abre internamento (capa_internamentos)
-  - Extrai 2 tabelas com parser 100% dinâmico:
-      • "Itens da Nota"  — qualquer número de colunas, identificada por score de headers
-      • "Cálculo Itens"  — qualquer número de colunas, mapeamento por alias de headers
-  - Mescla por ITEM (1..n) e retorna JSON consolidado
+  - Extrai 3 tabelas (100% dinâmico):
+      • "Itens lançamentos" (table#itens_lancamentos)  -> JSON separado
+      • "Itens da Nota" (score headers)                -> JSON separado
+      • "Cálculo Itens" (4 estratégias em cascata)     -> JSON separado
+  - Tenta mesclar no backend (por ITEM) em merged_by_item
+  - Retorna também as tabelas separadas para o HTML unir do jeito que quiser
 """
 
 from __future__ import annotations
@@ -43,18 +45,23 @@ import uvicorn
 # CONFIG
 # ══════════════════════════════════════════════════════════════════
 SUPABASE_URL  = os.getenv("SUPABASE_URL", "https://hysrxadnigzqadnlkynq.supabase.co").strip()
-SUPABASE_KEY  = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"
+# ⚠️ ideal: mover para ENV no Render
+SUPABASE_KEY  = os.getenv(
+    "SUPABASE_KEY",
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA",
+).strip()
+
 TABELA_CERTS  = os.getenv("TABELA_CERTS", "certifica_dfe").strip()
 DEBUG_ERRORS  = os.getenv("DEBUG_ERRORS", "1") == "1"
 LOG_FILE      = os.getenv("LOG_FILE", "/tmp/analise.log" if os.getenv("RENDER") else "analise.log")
 
-URL_DET_HOME          = "https://detsec.sefin.ro.gov.br/certificados"
-URL_ENTRAR            = "https://detsec.sefin.ro.gov.br/entrar"
-URL_REDIRECT_PORTAL   = "https://detsec.sefin.ro.gov.br/contribuinte/notificacoes/redirect_portal"
+URL_DET_HOME            = "https://detsec.sefin.ro.gov.br/certificados"
+URL_ENTRAR              = "https://detsec.sefin.ro.gov.br/entrar"
+URL_REDIRECT_PORTAL     = "https://detsec.sefin.ro.gov.br/contribuinte/notificacoes/redirect_portal"
 URL_PORTAL_HOME_DEFAULT = "https://portalcontribuinte.sefin.ro.gov.br/app/home/?exibir_modal=true"
-URL_CONSULTA_DEBITOS  = "https://portalcontribuinte.sefin.ro.gov.br/app/consultadebitos/"
+URL_CONSULTA_DEBITOS    = "https://portalcontribuinte.sefin.ro.gov.br/app/consultadebitos/"
 URL_CONSULTA_DEBITOS_LISTA = "https://portalcontribuinte.sefin.ro.gov.br/app/consultadebitos/lista.jsp"
-BASE_INTERNAMENTO     = "https://internamentonotas.sefin.ro.gov.br"
+BASE_INTERNAMENTO       = "https://internamentonotas.sefin.ro.gov.br"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -333,7 +340,6 @@ def _url_capa_internamento(usuario: str, chave: str, token: Optional[str]) -> st
 # ══════════════════════════════════════════════════════════════════
 # PARSER DINÂMICO DE INTERNAMENTO
 # ══════════════════════════════════════════════════════════════════
-
 def _norm_text(text: str) -> str:
     """Lowercase + sem acentos + espaço único."""
     t = re.sub(r"\s+", " ", (text or "").strip().lower())
@@ -364,8 +370,76 @@ def _table_data_rows(table: Tag) -> List[List[str]]:
     return rows
 
 
-# ── Scorers ────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
+# NOVO: parse da tabela "itens_lancamentos" (primeira tabela)
+# ──────────────────────────────────────────────────────────────────
+def _find_col_idx(norm_headers: List[str], *aliases: str) -> Optional[int]:
+    """Acha o primeiro índice que contenha qualquer alias (normalizado)."""
+    aliases_n = [_norm_text(a) for a in aliases]
+    for i, h in enumerate(norm_headers):
+        if any(a in h for a in aliases_n):
+            return i
+    return None
 
+
+def _parse_itens_lancamentos(soup: BeautifulSoup) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Tabela: <table id="itens_lancamentos">
+    Cabeçalho típico:
+      Tipo | Produto | Descrição | Valor Item | Valor Débito | Valor Crédito | Valor a Recolher
+    """
+    table = soup.find("table", {"id": "itens_lancamentos"})
+    if not table:
+        return [], {"encontrada": False, "motivo": "tabela id=itens_lancamentos nao existe"}
+
+    headers = [th.get_text(" ", strip=True) for th in table.find_all("th")]
+    hn = [_norm_text(h) for h in headers]
+
+    idx = {
+        "tipo":           _find_col_idx(hn, "tipo"),
+        "produto":        _find_col_idx(hn, "produto"),
+        "descricao":      _find_col_idx(hn, "descricao", "descrição", "descr"),
+        "valor_item":     _find_col_idx(hn, "valor item"),
+        "valor_debito":   _find_col_idx(hn, "valor debito", "valor débito"),
+        "valor_credito":  _find_col_idx(hn, "valor credito", "valor crédito"),
+        "valor_recolher": _find_col_idx(hn, "valor a recolher"),
+    }
+
+    def get(cols: List[str], key: str) -> Optional[str]:
+        i = idx.get(key)
+        if i is None or i < 0 or i >= len(cols):
+            return None
+        v = cols[i].strip()
+        return v or None
+
+    out: List[Dict[str, Any]] = []
+    for tr in table.find_all("tr"):
+        tds = tr.find_all("td")
+        if not tds:
+            continue
+        cols = [td.get_text(" ", strip=True) for td in tds]
+        if len(cols) < 3:
+            continue
+
+        row = {k: get(cols, k) for k in idx}
+        row["_data_tipo1"] = tr.get("data-tipo1")
+        row["_data_tipo2"] = tr.get("data-tipo2")
+
+        if not any([row.get("tipo"), row.get("produto"), row.get("descricao")]):
+            continue
+        out.append(row)
+
+    diag = {
+        "encontrada": True,
+        "headers_found": headers,
+        "n_headers": len(headers),
+        "col_map": idx,
+        "linhas_extraidas": len(out),
+    }
+    return out, diag
+
+
+# ── Scorers ────────────────────────────────────────────────────────
 _SCORE_ITENS_KW: List[Tuple[str, int]] = [
     ("ncm",              50),
     ("cfop",             30),
@@ -407,7 +481,6 @@ def _score_table(table: Tag, keywords: List[Tuple[str, int]], bonus_if_n_headers
     score = sum(pts for kw, pts in keywords if kw in joined)
     if bonus_if_n_headers and len(ths) == bonus_if_n_headers:
         score += 30
-    # Bônus por linhas numéricas com muitas colunas
     for row in _table_data_rows(table):
         if len(row) >= 10 and re.fullmatch(r"\d+", row[0].strip()):
             score += 5
@@ -441,48 +514,31 @@ def _pick_best_table(
 def _localizar_tabela_calculo(soup: BeautifulSoup) -> Tuple[Optional[Tag], str]:
     """
     Localiza a tabela de Cálculo Itens com 4 estratégias em cascata.
-
-    O problema real de produção: o lxml às vezes não contabiliza a tabela de
-    cálculo no find_all("table") quando o HTML do servidor tem estrutura
-    ligeiramente diferente (tabela aninhada em div específica, HTML mal-formado,
-    etc.). Por isso o scorer baseado em find_all("table") falha em prod.
-
-    Estratégias (ordem de prioridade):
-      1. div#calculo-itens-container  → busca pelo id fixo do container
-      2. tr.itens-calculos-row        → busca pela classe fixa dos TRs de dados
-      3. heading "Cálculo Itens"      → navega pelos parents ou usa find_next
-      4. scorer de headers             → último recurso, varre todas as tabelas
     """
-    # ── 1. ID direto do container ──────────────────────────────────────────
     container = soup.find("div", {"id": "calculo-itens-container"})
     if container:
         table = container.find("table")
         if table:
             return table, "id:calculo-itens-container"
 
-    # ── 2. Classe nos TRs de dados ─────────────────────────────────────────
     rows = soup.find_all("tr", class_="itens-calculos-row")
     if rows:
         table = rows[0].find_parent("table")
         if table:
             return table, "class:itens-calculos-row"
 
-    # ── 3. Heading "Cálculo Itens" ─────────────────────────────────────────
     for heading in soup.find_all(["h1", "h2", "h3", "h4", "h5"]):
         txt = _norm_text(heading.get_text())
         if "calculo itens" in txt or "calculo de itens" in txt:
-            # Tentar via parents (do mais próximo ao mais distante)
             for parent in heading.parents:
                 if parent.name in ("div", "section", "article"):
                     t = parent.find("table")
                     if t:
                         return t, "heading:parent"
-            # Fallback: próxima tabela no DOM
             t = heading.find_next("table")
             if t:
                 return t, "heading:next"
 
-    # ── 4. Scorer de headers (último recurso) ──────────────────────────────
     tables = soup.find_all("table")
     best: Optional[Tag] = None
     best_score = -1
@@ -491,33 +547,16 @@ def _localizar_tabela_calculo(soup: BeautifulSoup) -> Tuple[Optional[Tag], str]:
         if sc > best_score:
             best_score = sc
             best = t
-    if best and best_score >= 100:   # threshold alto para evitar falso positivo
+    if best and best_score >= 100:
         return best, f"scorer:score={best_score}"
 
     return None, "nao_encontrada"
 
 
 # ── Parse: Itens da Nota (dinâmico) ───────────────────────────────
-
-def _find_col_idx(norm_headers: List[str], *aliases: str) -> Optional[int]:
-    """Acha o primeiro índice que contenha qualquer alias (normalizado)."""
-    aliases_n = [_norm_text(a) for a in aliases]
-    for i, h in enumerate(norm_headers):
-        if any(a in h for a in aliases_n):
-            return i
-    return None
-
-
 def _parse_itens_da_nota(table: Tag) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Extrai todos os campos dos Itens da Nota de forma 100% dinâmica:
-    - Detecta automaticamente quantas colunas existem
-    - Mapeia cada campo pelo nome do header (não por posição fixa)
-    - Retorna TODAS as colunas em 'extra' além das conhecidas
-    """
     all_tr = table.find_all("tr")
 
-    # 1. Localizar linha de header (busca nos primeiros 15 TRs)
     header_cells: List[str] = []
     header_tr: Optional[Tag] = None
     for tr in all_tr[:15]:
@@ -533,7 +572,6 @@ def _parse_itens_da_nota(table: Tag) -> Tuple[List[Dict[str, Any]], Dict[str, An
 
     hn = [_norm_text(h) for h in header_cells]
 
-    # 2. Mapear colunas conhecidas
     idx = {
         "item":      _find_col_idx(hn, "item"),
         "descricao": _find_col_idx(hn, "descricao", "descrição", "descr"),
@@ -541,7 +579,7 @@ def _parse_itens_da_nota(table: Tag) -> Tuple[List[Dict[str, Any]], Dict[str, An
         "cfop":      _find_col_idx(hn, "cfop"),
         "cest":      _find_col_idx(hn, "cest"),
         "ncm":       _find_col_idx(hn, "ncm"),
-        # Colunas extras conhecidas da tabela 0
+
         "vbc_st":    _find_col_idx(hn, "valor base calc. st"),
         "vicms_st":  _find_col_idx(hn, "valor icms st"),
         "vicms_dest":_find_col_idx(hn, "valor icms uf dest"),
@@ -570,7 +608,6 @@ def _parse_itens_da_nota(table: Tag) -> Tuple[List[Dict[str, Any]], Dict[str, An
         return v or None
 
     items: List[Dict[str, Any]] = []
-
     for tr in all_tr:
         if tr is header_tr:
             continue
@@ -589,7 +626,6 @@ def _parse_itens_da_nota(table: Tag) -> Tuple[List[Dict[str, Any]], Dict[str, An
         row["item"] = item_str.strip()
         row["_n_cols"] = len(cols)
 
-        # Descartar linhas sem nenhum campo útil
         if not any([row.get("descricao"), row.get("ncm"), row.get("cfop"), row.get("cst")]):
             continue
 
@@ -605,8 +641,6 @@ def _parse_itens_da_nota(table: Tag) -> Tuple[List[Dict[str, Any]], Dict[str, An
 
 
 # ── Parse: Cálculo Itens (dinâmico) ───────────────────────────────
-
-# Mapeamento campo → aliases de header (ordem de prioridade)
 _CALC_COL_ALIASES: Dict[str, List[str]] = {
     "item":                   ["item"],
     "produto":                ["produto"],
@@ -646,17 +680,10 @@ def _build_calc_idx(header_cells: List[str]) -> Dict[str, Optional[int]]:
 
 
 def _parse_calculo_itens(table: Tag) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Parse 100% dinâmico da tabela Cálculo Itens:
-    - Lê os <th> para descobrir posição de cada coluna
-    - Aceita qualquer número de colunas (15, 16, 17, 18+)
-    - Colunas não mapeadas ficam registradas no diagnóstico
-    """
     all_tr = table.find_all("tr")
     if not all_tr:
         return [], {"erro": "tabela vazia"}
 
-    # 1. Localizar header row
     header_cells: List[str] = []
     header_tr: Optional[Tag] = None
     for tr in all_tr[:10]:
@@ -670,7 +697,6 @@ def _parse_calculo_itens(table: Tag) -> Tuple[List[Dict[str, Any]], Dict[str, An
         header_cells = [c.get_text(" ", strip=True) for c in cells]
         header_tr = all_tr[0]
 
-    # 2. Montar índice dinâmico
     col_idx = _build_calc_idx(header_cells)
     unmapped = [f for f, i in col_idx.items() if i is None]
     if unmapped:
@@ -683,9 +709,7 @@ def _parse_calculo_itens(table: Tag) -> Tuple[List[Dict[str, Any]], Dict[str, An
         v = cols[i].strip()
         return v or None
 
-    # 3. Extrair linhas
     out: List[Dict[str, Any]] = []
-
     for tr in all_tr:
         if tr is header_tr:
             continue
@@ -696,7 +720,6 @@ def _parse_calculo_itens(table: Tag) -> Tuple[List[Dict[str, Any]], Dict[str, An
         if len(cols) < 3:
             continue
 
-        # Coluna "item" deve ser inteiro
         item_val = get(cols, "item") or cols[0].strip()
         if not item_val or not re.fullmatch(r"\d+", item_val):
             continue
@@ -716,8 +739,7 @@ def _parse_calculo_itens(table: Tag) -> Tuple[List[Dict[str, Any]], Dict[str, An
     return out, diag
 
 
-# ── Merge consolidado ──────────────────────────────────────────────
-
+# ── Merge consolidado (por ITEM) ──────────────────────────────────
 def _merge_itens(
     itens_nota: List[Dict[str, Any]],
     calculo:    List[Dict[str, Any]],
@@ -735,7 +757,6 @@ def _merge_itens(
         k = str(it.get("item") or "").strip()
         c = calc_by_item.get(k)
 
-        # Campos base dos Itens da Nota
         row: Dict[str, Any] = {
             "item":       k or None,
             "descricao":  it.get("descricao"),
@@ -743,7 +764,7 @@ def _merge_itens(
             "cfop":       it.get("cfop"),
             "cest":       it.get("cest"),
             "ncm":        it.get("ncm"),
-            # Campos extras da tabela de itens
+
             "vbc_st":     it.get("vbc_st"),
             "vicms_st":   it.get("vicms_st"),
             "vicms_dest": it.get("vicms_dest"),
@@ -762,7 +783,7 @@ def _merge_itens(
             "cls":        it.get("cls"),
             "prod_sefin": it.get("prod_sefin"),
             "obs":        it.get("obs"),
-            # Campos do Cálculo (null se não encontrado)
+
             "calc_produto":      None,
             "calc_val_merc":     None,
             "calc_perc_red":     None,
@@ -814,29 +835,29 @@ def _merge_itens(
 
 
 # ── Entry point do parser ──────────────────────────────────────────
-
 def parse_internamento(html_intern: str) -> Dict[str, Any]:
     """
-    Recebe o HTML da página de internamento e retorna JSON consolidado.
-    Robusto a qualquer número de linhas e colunas em ambas as tabelas.
+    Retorna:
+      - tables.itens_lancamentos
+      - tables.itens_nota
+      - tables.calculo_itens
+      - merged_by_item (tentativa de merge por ITEM)
     """
     soup = BeautifulSoup(html_intern, "lxml")
 
-    # Tabela 1: Itens da Nota
-    tab_itens, diag_sel_itens = _pick_best_table(
-        soup, _SCORE_ITENS_KW, min_score=50
-    )
+    # 0) Primeira tabela (itens_lancamentos)
+    itens_lanc, diag_lanc = _parse_itens_lancamentos(soup)
+
+    # 1) Itens da Nota (tabela grande)
+    tab_itens, diag_sel_itens = _pick_best_table(soup, _SCORE_ITENS_KW, min_score=50)
     itens_nota: List[Dict[str, Any]] = []
     diag_parse_itens: Dict[str, Any] = {}
     if tab_itens:
         itens_nota, diag_parse_itens = _parse_itens_da_nota(tab_itens)
-    # Limpar campo de debug interno
     for it in itens_nota:
         it.pop("_n_cols", None)
 
-    # Tabela 2: Cálculo Itens — 4 estratégias em cascata
-    # Necessário pois em produção o lxml às vezes não conta a tabela de cálculo
-    # no find_all("table") (HTML do servidor ligeiramente diferente do local).
+    # 2) Cálculo Itens (tabela final)
     tab_calc, estrategia_calc = _localizar_tabela_calculo(soup)
     calc_itens: List[Dict[str, Any]] = []
     diag_parse_calc: Dict[str, Any] = {"estrategia": estrategia_calc}
@@ -847,24 +868,34 @@ def parse_internamento(html_intern: str) -> Dict[str, Any]:
     for c in calc_itens:
         c.pop("_n_cols", None)
 
-    # Merge
+    # 3) Merge backend por ITEM (se der)
     itens_consolidados, diag_merge = _merge_itens(itens_nota, calc_itens)
 
     return {
-        "itens_consolidados": itens_consolidados,
+        "tables": {
+            "itens_lancamentos": itens_lanc,
+            "itens_nota": itens_nota,
+            "calculo_itens": calc_itens,
+        },
+        "merged_by_item": itens_consolidados,
         "totais": {
-            "qtd_itens":          len(itens_consolidados),
-            "n_cols_itens_nota":  diag_parse_itens.get("n_headers", 0),
-            "n_cols_calculo":     diag_parse_calc.get("n_headers", 0),
-            "linhas_calculo":     len(calc_itens),
-            "itens_com_calculo":  diag_merge["itens_com_calculo"],
-            "itens_sem_calculo":  diag_merge["itens_sem_calculo"],
-            "itens_sem_ncm":      sum(1 for x in itens_consolidados if not x.get("ncm")),
+            "qtd_itens_merge":       len(itens_consolidados),
+            "qtd_itens_nota":        len(itens_nota),
+            "qtd_itens_calculo":     len(calc_itens),
+            "qtd_itens_lancamentos": len(itens_lanc),
+
+            "n_cols_itens_nota":     diag_parse_itens.get("n_headers", 0),
+            "n_cols_calculo":        diag_parse_calc.get("n_headers", 0),
+
+            "itens_com_calculo":     diag_merge.get("itens_com_calculo", 0),
+            "itens_sem_calculo":     diag_merge.get("itens_sem_calculo", 0),
+            "itens_sem_ncm":         sum(1 for x in itens_consolidados if not x.get("ncm")),
         },
         "diagnostico": {
+            "itens_lancamentos": diag_lanc,
             "itens_da_nota": {**diag_sel_itens, "parse": diag_parse_itens},
             "calculo_itens": diag_parse_calc,
-            "merge":         diag_merge,
+            "merge": diag_merge,
         },
     }
 
@@ -872,7 +903,7 @@ def parse_internamento(html_intern: str) -> Dict[str, Any]:
 # ══════════════════════════════════════════════════════════════════
 # APP FASTAPI
 # ══════════════════════════════════════════════════════════════════
-app = FastAPI(title="analise — Débitos + Extrato por Produto (Itens + Cálculo consolidado)")
+app = FastAPI(title="analise — Débitos + Extrato por Produto (3 tabelas + merge opcional)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1041,7 +1072,7 @@ def extrato_produto(
         if r2.status_code != 200:
             raise HTTPException(400, f"Falha ao abrir internamento: HTTP {r2.status_code}")
 
-        # Parser dinâmico
+        # Parser dinâmico (agora retorna tabelas separadas + merge opcional)
         parsed = parse_internamento(r2.text)
 
         return {
@@ -1055,7 +1086,7 @@ def extrato_produto(
                 "token_found": bool(token),
                 "usuario":     usuario,
                 "chave":       chave_alvo,
-                **parsed,          # itens_consolidados + totais + diagnostico
+                **parsed,
             },
         }
 
