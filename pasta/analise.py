@@ -9,14 +9,10 @@ analise.py — FastAPI (Render)
 
 ✅ Login: DET → Portal usando mTLS (cert pem/key do Supabase)
 
-✅ /extrato-produto (NOVA SAÍDA):
-  - Abre extrato.jsp, extrai TOKEN + USUARIO e CHAVE (se houver)
-  - Abre internamento (capa_internamentos)
-  - Extrai APENAS a ÚLTIMA tabela de "Cálculo Itens" que contém "Val. a Recolher."
-  - Retorna somente:
-      result.calculo_itens (lista)
-      result.totais (qtd/colunas)
-      result.diagnostico (como achou a tabela)
+✅ ALTERAÇÃO PEDIDA (AGORA):
+  - /extrato-produto retorna SOMENTE a PRIMEIRA tabela (table#itens_lancamentos)
+  - E corta ATÉ a coluna 10 (primeiras 10 colunas), incluindo headers e linhas.
+  - NÃO traz mais "itens_nota", "calculo_itens" nem merge.
 """
 
 from __future__ import annotations
@@ -239,7 +235,6 @@ def obter_debitos_inscricao_estadual(html_deb: str) -> List[Dict[str, str]]:
             break
     if not tabela_alvo:
         return []
-
     linhas = tabela_alvo.find_all("tr")
     if len(linhas) <= 2:
         return []
@@ -337,245 +332,82 @@ def _url_capa_internamento(usuario: str, chave: str, token: Optional[str]) -> st
 
 
 # ══════════════════════════════════════════════════════════════════
-# PARSER (SOMENTE ÚLTIMA TABELA DE CÁLCULO)
+# PARSER: SOMENTE PRIMEIRA TABELA (itens_lancamentos) ATÉ COLUNA 10
 # ══════════════════════════════════════════════════════════════════
-def _norm_text(text: str) -> str:
-    """Lowercase + sem acentos + espaço único."""
-    t = re.sub(r"\s+", " ", (text or "").strip().lower())
-    for src, dst in [
-        ("á","a"),("à","a"),("â","a"),("ã","a"),
-        ("é","e"),("ê","e"),("è","e"),
-        ("í","i"),("î","i"),
-        ("ó","o"),("ô","o"),("õ","o"),
-        ("ú","u"),("û","u"),
-        ("ç","c"),
-    ]:
-        t = t.replace(src, dst)
-    return t
-
-
 def _table_headers(table: Tag) -> List[str]:
     return [th.get_text(" ", strip=True) for th in table.find_all("th")]
 
 
-_SCORE_CALC_KW: List[Tuple[str, int]] = [
-    ("val. mercadoria",        40),
-    ("val. debito mercadoria", 40),
-    ("val. a recolher",        60),
-    ("base calc. final",       30),
-    ("frete fob",              25),
-    ("aliq. interna",          20),
-    ("% reducao",              20),
-    ("val. credito nfe",       20),
-    ("val. cred. comple",      20),
-    ("aliq. orig. nfe",        15),
-    ("aliq. orig. cte",        15),
-    ("base calc. mercadoria",  15),
-    ("base calc. frete",       10),
-    ("produto",                 5),
-    ("item",                    5),
-]
+def _parse_primeira_tabela_ate_col10(soup: BeautifulSoup) -> Dict[str, Any]:
+    """
+    Pega SOMENTE table#itens_lancamentos (primeira tabela)
+    e corta para as primeiras 10 colunas (0..9).
+    """
+    table = soup.find("table", {"id": "itens_lancamentos"})
+    if not table:
+        return {
+            "encontrada": False,
+            "motivo": "tabela id=itens_lancamentos nao existe",
+            "headers": [],
+            "rows": [],
+        }
 
+    headers_full = _table_headers(table)
+    headers = headers_full[:10]
 
-def _score_calc_headers(ths: List[str]) -> int:
-    joined = _norm_text(" | ".join(ths))
-    score = sum(pts for kw, pts in _SCORE_CALC_KW if kw in joined)
-    if len(ths) == 17:
-        score += 50
-    return score
-
-
-def _is_valid_calc_table(t: Optional[Tag]) -> Tuple[bool, Dict[str, Any]]:
-    if not t:
-        return False, {"ok": False, "motivo": "tabela_none"}
-
-    ths = _table_headers(t)
-    if not ths:
-        return False, {"ok": False, "motivo": "sem_th"}
-
-    joined = _norm_text(" | ".join(ths))
-    has_recolher = ("val. a recolher" in joined) or ("valor a recolher" in joined)
-    score = _score_calc_headers(ths)
-
-    ok = False
-    if len(ths) == 17 and has_recolher:
-        ok = True
-    elif score >= 120 and has_recolher:
-        ok = True
-
-    return ok, {
-        "ok": ok,
-        "n_headers": len(ths),
-        "has_recolher": has_recolher,
-        "score": score,
-        "headers_preview": ths[:6],
-    }
-
-
-_CALC_COL_ALIASES: Dict[str, List[str]] = {
-    "item":                   ["item"],
-    "produto":                ["produto"],
-    "val_mercadoria":         ["val. mercadoria", "valor mercadoria", "mercadoria"],
-    "perc_reducao":           ["% reducao base calc", "reducao base calc", "% reducao"],
-    "bc_mercadoria":          ["base calc. mercadoria", "base calc mercadoria"],
-    "frete_fob":              ["frete fob (cte)", "frete fob", "frete"],
-    "bc_frete":               ["base calc. frete-fob", "base calc frete fob", "base calc frete"],
-    "bc_final":               ["base calc. final", "base calc final"],
-    "aliq_interna":           ["% aliq. interna", "aliq. interna", "aliq interna"],
-    "aliq_orig_nfe":          ["%aliq. orig. nfe", "aliq. orig. nfe", "aliq orig nfe"],
-    "aliq_orig_cte":          ["%aliq. orig. cte", "aliq. orig. cte", "aliq orig cte"],
-    "val_deb_mercadoria":     ["val. debito mercadoria", "val. débito mercadoria", "val. debito merc"],
-    "val_deb_frete":          ["val. debito frete-fob", "val. débito frete-fob", "val. debito frete"],
-    "val_cred_nfe":           ["val. credito nfe", "val. crédito nfe", "val. cred. nfe"],
-    "val_cred_cte":           ["val. credito cte", "val. crédito cte", "val. cred. cte"],
-    "val_cred_complementar":  ["val. créd. comple", "val. cred. comple", "val. credito compl", "cred. comple"],
-    "valor_a_recolher":       ["val. a recolher", "val. a recolher.", "valor a recolher"],
-}
-
-
-def _build_calc_idx(header_cells: List[str]) -> Dict[str, Optional[int]]:
-    hn = [_norm_text(h) for h in header_cells]
-    result: Dict[str, Optional[int]] = {}
-    for field, aliases in _CALC_COL_ALIASES.items():
-        found = None
-        for alias in aliases:
-            alias_n = _norm_text(alias)
-            for i, h in enumerate(hn):
-                if alias_n in h:
-                    found = i
-                    break
-            if found is not None:
-                break
-        result[field] = found
-    return result
-
-
-def _parse_calculo_itens(table: Tag) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    all_tr = table.find_all("tr")
-    if not all_tr:
-        return [], {"erro": "tabela_vazia"}
-
-    header_cells: List[str] = []
-    header_tr: Optional[Tag] = None
-    for tr in all_tr[:12]:
-        ths = tr.find_all("th")
-        if len(ths) >= 10:
-            header_cells = [th.get_text(" ", strip=True) for th in ths]
-            header_tr = tr
-            break
-    if not header_cells and all_tr:
-        cells = all_tr[0].find_all(["td", "th"])
-        header_cells = [c.get_text(" ", strip=True) for c in cells]
-        header_tr = all_tr[0]
-
-    col_idx = _build_calc_idx(header_cells)
-    unmapped = [f for f, i in col_idx.items() if i is None]
-    if unmapped:
-        logger.warning("Cálculo Itens — colunas não mapeadas: %s", unmapped)
-
-    def get(cols: List[str], field: str) -> Optional[str]:
-        i = col_idx.get(field)
-        if i is None or i < 0 or i >= len(cols):
-            return None
-        v = cols[i].strip()
-        return v or None
-
-    out: List[Dict[str, Any]] = []
-    for tr in all_tr:
-        if tr is header_tr:
-            continue
+    rows: List[Dict[str, Any]] = []
+    for tr in table.find_all("tr"):
         tds = tr.find_all("td")
         if not tds:
             continue
-        cols = [td.get_text(" ", strip=True) for td in tds]
-        if len(cols) < 5:
+        cols_full = [td.get_text(" ", strip=True) for td in tds]
+        cols = cols_full[:10]
+
+        # ignora linha vazia
+        if not any((c or "").strip() for c in cols):
             continue
 
-        item_val = get(cols, "item") or cols[0].strip()
-        if not item_val or not re.fullmatch(r"\d+", item_val):
-            continue
+        # monta objeto por header (quando existir), e guarda cols_raw
+        obj: Dict[str, Any] = {"cols_raw": cols}
+        for i, h in enumerate(headers):
+            key = (h or f"col_{i+1}").strip() or f"col_{i+1}"
+            obj[key] = cols[i] if i < len(cols) else None
 
-        row: Dict[str, Any] = {f: get(cols, f) for f in _CALC_COL_ALIASES}
-        row["item"] = item_val
-        out.append(row)
+        # mantém atributos úteis se existirem
+        if tr.get("data-tipo1") is not None:
+            obj["_data_tipo1"] = tr.get("data-tipo1")
+        if tr.get("data-tipo2") is not None:
+            obj["_data_tipo2"] = tr.get("data-tipo2")
 
-    diag = {
-        "headers_found": header_cells,
-        "n_headers": len(header_cells),
-        "col_map": col_idx,
-        "colunas_nao_mapeadas": unmapped,
-        "linhas_extraidas": len(out),
-    }
-    return out, diag
+        rows.append(obj)
 
-
-def _localizar_ultima_tabela_calculo(soup: BeautifulSoup) -> Tuple[Optional[Tag], Dict[str, Any]]:
-    """
-    Encontra TODAS as tabelas candidatas de cálculo e retorna a ÚLTIMA no DOM
-    que seja válida e contenha "Val. a Recolher".
-    """
-    tables = soup.find_all("table")
-    valid: List[Tag] = []
-    checks: List[Dict[str, Any]] = []
-
-    for i, t in enumerate(tables):
-        ok, info = _is_valid_calc_table(t)
-        info2 = {"i": i, **info}
-        checks.append(info2)
-        if ok:
-            valid.append(t)
-
-    if not valid:
-        return None, {
-            "estrategia": "ultima_validada",
-            "tables_found": len(tables),
-            "validas": 0,
-            "checks": checks,
-            "motivo": "nenhuma_tabela_calc_valida",
-        }
-
-    # ✅ pega a última válida no DOM
-    chosen = valid[-1]
-    # acha o índice dela para diagnóstico
-    chosen_index = None
-    for i, t in enumerate(tables):
-        if t == chosen:
-            chosen_index = i
-            break
-
-    ths = _table_headers(chosen)
-    return chosen, {
-        "estrategia": "ultima_validada",
-        "tables_found": len(tables),
-        "validas": len(valid),
-        "chosen_index": chosen_index,
-        "chosen_n_headers": len(ths),
-        "chosen_has_recolher": ("val. a recolher" in _norm_text(" | ".join(ths))),
-        "chosen_score": _score_calc_headers(ths),
-        "checks": checks,
+    return {
+        "encontrada": True,
+        "headers": headers,
+        "headers_full_n": len(headers_full),
+        "headers_cut_n": len(headers),
+        "rows_count": len(rows),
+        "rows": rows,
     }
 
 
 def parse_internamento(html_intern: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html_intern, "lxml")
-
-    tab_calc, diag_find = _localizar_ultima_tabela_calculo(soup)
-
-    calc_itens: List[Dict[str, Any]] = []
-    diag_parse: Dict[str, Any] = {}
-    if tab_calc:
-        calc_itens, diag_parse = _parse_calculo_itens(tab_calc)
+    tab = _parse_primeira_tabela_ate_col10(soup)
 
     return {
-        "calculo_itens": calc_itens,
+        "itens_lancamentos": tab.get("rows", []),
+        "headers": tab.get("headers", []),
         "totais": {
-            "qtd_itens_calculo": len(calc_itens),
-            "n_cols_calculo": diag_parse.get("n_headers", 0),
-            "itens_sem_valor_a_recolher": sum(1 for x in calc_itens if not x.get("valor_a_recolher")),
+            "tabela_encontrada": bool(tab.get("encontrada")),
+            "qtd_linhas": int(tab.get("rows_count") or 0),
+            "qtd_colunas": int(tab.get("headers_cut_n") or 0),
         },
         "diagnostico": {
-            "find_calculo": diag_find,
-            "parse_calculo": diag_parse,
+            "encontrada": tab.get("encontrada"),
+            "motivo": tab.get("motivo"),
+            "headers_full_n": tab.get("headers_full_n"),
+            "headers_cut_n": tab.get("headers_cut_n"),
         },
     }
 
@@ -583,7 +415,7 @@ def parse_internamento(html_intern: str) -> Dict[str, Any]:
 # ══════════════════════════════════════════════════════════════════
 # APP FASTAPI
 # ══════════════════════════════════════════════════════════════════
-app = FastAPI(title="analise — Débitos + Extrato por Produto (somente última tabela de cálculo)")
+app = FastAPI(title="analise — Débitos + Extrato (somente primeira tabela até coluna 10)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -763,7 +595,7 @@ def extrato_produto(
                 "token_found": bool(token),
                 "usuario":     usuario,
                 "chave":       chave_alvo,
-                **parsed,  # ✅ agora vem SOMENTE calculo_itens + totais + diagnostico
+                **parsed,  # ✅ somente primeira tabela até coluna 10
             },
         }
 
