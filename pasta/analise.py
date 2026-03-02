@@ -9,17 +9,11 @@ analise.py — FastAPI (Render)
   GET /extrato-produto?user=...&codi=...&url_extrato=...&chave=...
 
 🔧 /extrato-produto:
-  ✅ Lê TODAS as NF-e do extrato (tabela)
-  ✅ Para cada NF-e: abre internamento e retorna APENAS "Itens da nota" (10 colunas)
-  ✅ Também abre o cteconsulta.jsp?chave=<CHAVE_NFE> e captura chave(s) de CT-e, se houver
-  ✅ (Opcional) Usa "Exibidor ListGatem" para baixar XML de NF-e e CT-e e converter
-
-ENV (opcional) p/ ListGatem:
-  LISTGATEM_BASE="https://seu-servidor-listgatem.exemplo"
-  LISTGATEM_KEY="se_tiver_token"   (vai em Authorization: Bearer)
-  LISTGATEM_TIMEOUT="60"
-  LISTGATEM_PATH="/exibir"         (default: /exibir)
-  -> Requisição padrão: GET {BASE}{PATH}?tipo=NFE|CTE&chave=<44>
+  ✅ Lê TODAS as chaves de NF-e na listagem do extrato (conta corrente)
+  ✅ Para cada NF-e:
+      - abre internamento e retorna SOMENTE "Itens da nota" (10 colunas)
+      - abre cteconsulta.jsp e retorna SOMENTE chaves de CT-e (sem misturar NF-e)
+  ✅ Retorna também lista agregada de CT-e do extrato
 """
 
 from __future__ import annotations
@@ -33,7 +27,6 @@ import logging
 from logging.handlers import RotatingFileHandler
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from xml.etree import ElementTree as ET
 
 import requests
 from bs4 import BeautifulSoup
@@ -50,7 +43,7 @@ import uvicorn
 SUPABASE_URL  = os.getenv("SUPABASE_URL", "https://hysrxadnigzqadnlkynq.supabase.co").strip()
 SUPABASE_KEY  = os.getenv(
     "SUPABASE_KEY",
-    "CHANGE_ME",
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA",
 ).strip()
 
 TABELA_CERTS  = os.getenv("TABELA_CERTS", "certifica_dfe").strip()
@@ -63,16 +56,9 @@ URL_REDIRECT_PORTAL     = "https://detsec.sefin.ro.gov.br/contribuinte/notificac
 URL_PORTAL_HOME_DEFAULT = "https://portalcontribuinte.sefin.ro.gov.br/app/home/?exibir_modal=true"
 URL_CONSULTA_DEBITOS    = "https://portalcontribuinte.sefin.ro.gov.br/app/consultadebitos/"
 URL_CONSULTA_DEBITOS_LISTA = "https://portalcontribuinte.sefin.ro.gov.br/app/consultadebitos/lista.jsp"
+
 BASE_INTERNAMENTO       = "https://internamentonotas.sefin.ro.gov.br"
 BASE_CONTA_CORRENTE     = "https://portalcontribuinte.sefin.ro.gov.br/app/contacorrente/"
-
-# ListGatem (opcional)
-LISTGATEM_BASE    = os.getenv("LISTGATEM_BASE", "").strip().rstrip("/")
-LISTGATEM_KEY     = os.getenv("LISTGATEM_KEY", "").strip()
-LISTGATEM_TIMEOUT = int(os.getenv("LISTGATEM_TIMEOUT", "60"))
-LISTGATEM_PATH    = os.getenv("LISTGATEM_PATH", "/exibir").strip()
-if not LISTGATEM_PATH.startswith("/"):
-    LISTGATEM_PATH = "/" + LISTGATEM_PATH
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -95,7 +81,7 @@ def _now_iso() -> str:
 # ══════════════════════════════════════════════════════════════════
 def _require_supabase():
     if not SUPABASE_URL or not SUPABASE_KEY or SUPABASE_KEY == "CHANGE_ME":
-        raise HTTPException(500, "Configure SUPABASE_URL e SUPABASE_KEY no ENV.")
+        raise HTTPException(500, "Configure SUPABASE_URL e SUPABASE_KEY no ENV do Render.")
 
 
 def supabase_headers() -> Dict[str, str]:
@@ -322,11 +308,20 @@ def consultar_debitos_ano(sess: requests.Session, ano: int) -> Tuple[List[Dict[s
 
 
 # ══════════════════════════════════════════════════════════════════
-# EXTRATO (conta-corrente) → TOKEN / USUARIO / CHAVES NFE / LINK CTE
+# EXTRATO → TOKEN / USUARIO / CHAVES NFE / LINK CTE
 # ══════════════════════════════════════════════════════════════════
 def _extrair_token_e_usuario(html_extrato: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Suporta dois formatos:
+      (A) extrato antigo: var TOKEN='...' e "Olá <strong>CPF -"
+      (B) conta corrente: var TOKEN='...' e var CPF_CLIENTE=('...')...
+    """
     m1 = re.search(r"var\s+TOKEN\s*=\s*'([^']+)'", html_extrato)
     token = m1.group(1).strip() if m1 else None
+
+    m2 = re.search(r"Ol[áa]\s*<strong>\s*([0-9]{11})\s*-", html_extrato, flags=re.I)
+    if m2:
+        return token, m2.group(1).strip()
 
     m3 = re.search(r"var\s+CPF_CLIENTE\s*=\s*\(\s*'([^']*)'\s*\|\|\s*''\s*\)", html_extrato)
     if m3:
@@ -334,29 +329,32 @@ def _extrair_token_e_usuario(html_extrato: str) -> Tuple[Optional[str], Optional
         if cpf:
             return token, cpf
 
-    m2 = re.search(r"Ol[áa]\s*<strong>\s*([0-9]{11})\s*-", html_extrato, flags=re.I)
-    if m2:
-        return token, m2.group(1).strip()
-
     return token, None
 
 
 def _extrair_notas_do_extrato_contacorrente(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     """
-    Regra fiel ao HTML:
-      - chave_nfe: 44 dígitos (pode estar no <td> OU no data-chave do link class="abrir-cte")
-      - cte_modal_rel: vem de onclick="abrirModal('cteconsulta.jsp?chave=<CHAVE_NFE>'); ..."
-        (ou seja, cteconsulta recebe a CHAVE DA NFE)
+    Extrai TODAS as NF-e exibidas na tabela do extrato.
+
+    - chave_nfe: tenta:
+        1) <a class="abrir-cte" data-chave="...">
+        2) primeira <td> da linha
+        3) qualquer <td>/<a> da linha com 44 dígitos (fallback)
+    - cte_modal_rel: onclick abrirModal('cteconsulta.jsp?chave=...') na mesma linha
     """
     notas: List[Dict[str, Any]] = []
 
     for tr in soup.find_all("tr"):
         chave_nfe = None
 
-        a_intern = tr.find("a", {"class": "abrir-cte"})
-        if a_intern:
-            chave_nfe = (a_intern.get("data-chave") or "").strip()
+        # 1) data-chave
+        a_extrato = tr.find("a", {"class": "abrir-cte"})
+        if a_extrato:
+            v = (a_extrato.get("data-chave") or "").strip()
+            if re.fullmatch(r"\d{44}", v):
+                chave_nfe = v
 
+        # 2) primeira coluna
         if not chave_nfe:
             tds = tr.find_all("td")
             if tds:
@@ -364,9 +362,17 @@ def _extrair_notas_do_extrato_contacorrente(soup: BeautifulSoup) -> List[Dict[st
                 if re.fullmatch(r"\d{44}", t0):
                     chave_nfe = t0
 
+        # 3) fallback: qualquer 44 dígitos na linha
+        if not chave_nfe:
+            line_txt = tr.get_text(" ", strip=True) or ""
+            m = re.search(r"\b(\d{44})\b", line_txt)
+            if m:
+                chave_nfe = m.group(1)
+
         if not chave_nfe or not re.fullmatch(r"\d{44}", chave_nfe):
             continue
 
+        # captura link do modal de CTE na mesma linha
         cte_modal_rel = ""
         for a in tr.find_all("a"):
             onclick = a.get("onclick") or ""
@@ -377,6 +383,7 @@ def _extrair_notas_do_extrato_contacorrente(soup: BeautifulSoup) -> List[Dict[st
 
         notas.append({"chave_nfe": chave_nfe, "cte_modal_rel": cte_modal_rel})
 
+    # dedup mantendo ordem
     seen = set()
     out = []
     for n in notas:
@@ -401,20 +408,39 @@ def _resolver_url_cteconsulta(rel: str) -> str:
     return requests.compat.urljoin(BASE_CONTA_CORRENTE, rel)
 
 
+def _extrair_chave_da_query(url: str) -> Optional[str]:
+    if not url:
+        return None
+    m = re.search(r"[?&]chave=(\d{44})", url)
+    return m.group(1) if m else None
+
+
 def _buscar_chaves_cte(sess: requests.Session, url_cteconsulta: str) -> List[str]:
+    """
+    Abre o cteconsulta.jsp e extrai SOMENTE chaves de CT-e.
+    Remove a chave da NF-e consultada (porque o HTML costuma repetir ela).
+    """
     if not url_cteconsulta:
         return []
+
+    chave_consultada = _extrair_chave_da_query(url_cteconsulta)
+
     try:
-        r = sess.get(url_cteconsulta, timeout=LISTGATEM_TIMEOUT, allow_redirects=True)
+        r = sess.get(url_cteconsulta, timeout=45, allow_redirects=True)
         if r.status_code != 200:
             return []
+
         chaves = re.findall(r"\b\d{44}\b", r.text or "")
+
         seen = set()
-        out = []
+        out: List[str] = []
         for c in chaves:
-            if c not in seen:
-                seen.add(c)
-                out.append(c)
+            if chave_consultada and c == chave_consultada:
+                continue
+            if c in seen:
+                continue
+            seen.add(c)
+            out.append(c)
         return out
     except Exception:
         return []
@@ -483,6 +509,7 @@ def _parse_itens_da_nota_primeiras_10_colunas(soup: BeautifulSoup) -> Dict[str, 
             continue
 
         cols_cut = cols_full[:10]
+
         item0 = (cols_cut[0].strip() if cols_cut else "")
         if not re.fullmatch(r"\d+", item0 or ""):
             continue
@@ -498,8 +525,14 @@ def _parse_itens_da_nota_primeiras_10_colunas(soup: BeautifulSoup) -> Dict[str, 
         "motivo": None,
         "headers": headers_cut,
         "itens": itens,
-        "totais": {"qtd_linhas": len(itens), "qtd_colunas": len(headers_cut)},
-        "diagnostico": {"headers_full_n": len(headers_full), "headers_cut_n": len(headers_cut)},
+        "totais": {
+            "qtd_linhas": len(itens),
+            "qtd_colunas": len(headers_cut),
+        },
+        "diagnostico": {
+            "headers_full_n": len(headers_full),
+            "headers_cut_n": len(headers_cut),
+        },
     }
 
 
@@ -509,108 +542,9 @@ def parse_internamento(html_intern: str) -> Dict[str, Any]:
 
 
 # ══════════════════════════════════════════════════════════════════
-# LISTGATEM (opcional): baixar XML e converter
-# ══════════════════════════════════════════════════════════════════
-def _xml_elem_to_obj(elem: ET.Element) -> Any:
-    children = list(elem)
-    text = (elem.text or "").strip()
-    obj: Dict[str, Any] = {}
-    if elem.attrib:
-        obj["@attr"] = dict(elem.attrib)
-
-    if children:
-        # agrupa por tag
-        groups: Dict[str, List[Any]] = {}
-        for ch in children:
-            groups.setdefault(ch.tag, []).append(_xml_elem_to_obj(ch))
-        for k, v in groups.items():
-            obj[k] = v[0] if len(v) == 1 else v
-        if text:
-            obj["#text"] = text
-        return obj
-
-    # sem filhos
-    if obj:
-        if text:
-            obj["#text"] = text
-        return obj
-    return text
-
-
-def _xml_to_dict(xml_text: str) -> Dict[str, Any]:
-    root = ET.fromstring(xml_text.encode("utf-8", errors="ignore"))
-    return {root.tag: _xml_elem_to_obj(root)}
-
-
-def _listgatem_fetch(tipo: str, chave_44: str) -> Dict[str, Any]:
-    """
-    Busca no 'exibidor' do ListGatem.
-    Padrão: GET {LISTGATEM_BASE}{LISTGATEM_PATH}?tipo=NFE|CTE&chave=44
-
-    Retorna:
-      { ok, http_status, content_type, raw (string curta), xml (string), json (dict) }
-    """
-    if not LISTGATEM_BASE:
-        return {"ok": False, "motivo": "LISTGATEM_BASE não configurado"}
-
-    if not re.fullmatch(r"\d{44}", chave_44 or ""):
-        return {"ok": False, "motivo": "chave inválida (não tem 44 dígitos)"}
-
-    url = LISTGATEM_BASE + LISTGATEM_PATH
-    headers = {}
-    if LISTGATEM_KEY:
-        headers["Authorization"] = f"Bearer {LISTGATEM_KEY}"
-
-    try:
-        r = requests.get(
-            url,
-            params={"tipo": tipo, "chave": chave_44},
-            headers=headers,
-            timeout=LISTGATEM_TIMEOUT,
-        )
-        ct = (r.headers.get("content-type") or "").lower()
-
-        out: Dict[str, Any] = {
-            "ok": r.status_code == 200,
-            "http_status": r.status_code,
-            "content_type": ct,
-            "final_url": r.url,
-        }
-
-        body = (r.text or "").strip()
-        if not body:
-            out["raw"] = ""
-            return out
-
-        # tenta JSON
-        if "application/json" in ct:
-            try:
-                out["json"] = r.json()
-                return out
-            except Exception:
-                out["raw"] = body[:2000]
-                return out
-
-        # tenta XML
-        if body.startswith("<"):
-            out["xml"] = body
-            try:
-                out["json"] = _xml_to_dict(body)
-            except Exception as e:
-                out["xml_parse_error"] = str(e)
-            return out
-
-        out["raw"] = body[:2000]
-        return out
-
-    except Exception as e:
-        return {"ok": False, "motivo": f"Erro ListGatem: {e}"}
-
-
-# ══════════════════════════════════════════════════════════════════
 # APP FASTAPI
 # ══════════════════════════════════════════════════════════════════
-app = FastAPI(title="analise — Débitos + Extrato (Itens da nota + CT-e + ListGatem)")
+app = FastAPI(title="analise — Extrato (NFe + CTe separados) + Itens (10 colunas)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -646,6 +580,16 @@ async def global_exception_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content=base)
 
 
+@app.get("/")
+def root():
+    return {
+        "ok":      True,
+        "service": "analise",
+        "date_utc": _now_iso(),
+        "routes":  ["/health", "/empresas", "/debitos", "/extrato-produto"],
+    }
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "date_utc": _now_iso()}
@@ -674,8 +618,8 @@ def empresas(user: str = Query(...)):
 
 @app.get("/debitos")
 def route_debitos(
-    user:                 str = Query(...),
-    codi:                 str = Query(...),
+    user:                str = Query(...),
+    codi:                str = Query(...),
     incluir_ano_anterior: int = Query(1),
 ):
     if not user or "@" not in user:
@@ -704,7 +648,13 @@ def route_debitos(
             debs, _ = consultar_debitos_ano(sess, a)
             all_debs.extend(debs or [])
 
-        return {"ok": True, "user": user, "codi": str(cert.get("codi") or ""), "empresa": (cert.get("empresa") or ""), "debitos": all_debs}
+        return {
+            "ok":      True,
+            "user":    user,
+            "codi":    str(cert.get("codi") or ""),
+            "empresa": (cert.get("empresa") or ""),
+            "debitos": all_debs,
+        }
 
     finally:
         for p in (cert_path, key_path):
@@ -717,20 +667,19 @@ def route_debitos(
 
 @app.get("/extrato-produto")
 def extrato_produto(
-    user:          str = Query(...),
-    codi:          str = Query(...),
-    url_extrato:   str = Query(...),
-    chave:         str = Query(""),
-    max_notas:     int = Query(60),
-    buscar_cte:    int = Query(1),
-    baixar_docs:   int = Query(1),  # tenta ListGatem p/ NFE/CTE
+    user:        str = Query(...),
+    codi:        str = Query(...),
+    url_extrato: str = Query(...),
+    chave:       str = Query(""),
+    max_notas:   int = Query(200),
+    buscar_cte:  int = Query(1),
 ):
     """
-    - Se 'chave' vier preenchida: processa só ela (como NF-e).
-    - Se não vier: pega TODAS as chaves NF-e da tabela do extrato.
+    - Se 'chave' vier preenchida: processa só ela (NF-e).
+    - Se não vier: pega TODAS as chaves NF-e da listagem do extrato.
     - Para cada NF-e: abre internamento e retorna "Itens da nota" (10 colunas).
-    - Se buscar_cte=1: abre cteconsulta.jsp?chave=<CHAVE_NFE> e captura chaves CT-e.
-    - Se baixar_docs=1 e LISTGATEM_BASE configurado: baixa e converte XML de NF-e e CT-e.
+    - Se buscar_cte=1: abre também cteconsulta.jsp e captura SOMENTE chaves CT-e.
+    - Retorna também cte_chaves_total agregado (único) do extrato.
     """
     if not user or "@" not in user:
         raise HTTPException(400, "user inválido.")
@@ -738,7 +687,10 @@ def extrato_produto(
         raise HTTPException(400, "codi obrigatório.")
     if not url_extrato.startswith("http"):
         raise HTTPException(400, "url_extrato deve começar com http/https.")
-    max_notas = max(1, min(int(max_notas or 60), 200))
+    if max_notas < 1:
+        max_notas = 1
+    if max_notas > 500:
+        max_notas = 500
 
     certs = carregar_certificados(user)
     cert  = selecionar_cert_por_codi(certs, codi)
@@ -765,7 +717,7 @@ def extrato_produto(
         soup_extrato = BeautifulSoup(r.text, "lxml")
         notas_meta = _extrair_notas_do_extrato_contacorrente(soup_extrato)
 
-        # se veio "chave", assume NF-e específica
+        # se veio "chave", filtra
         chave = (chave or "").strip()
         if chave:
             if not re.fullmatch(r"\d{44}", chave):
@@ -784,19 +736,23 @@ def extrato_produto(
                     "final_url_extrato": r.url,
                     "token_found": bool(token),
                     "usuario": usuario,
-                    "total_notas": 0,
-                    "notas": [],
-                },
+                    "total_notas_nfe": 0,
+                    "notas_nfe": [],
+                    "cte_chaves_total": [],
+                }
             }
 
         notas_meta = notas_meta[:max_notas]
+
         notas_out: List[Dict[str, Any]] = []
+        cte_total_set: set = set()
 
         for meta in notas_meta:
             chave_nfe = meta["chave_nfe"]
             url_capa = _url_capa_internamento(usuario, chave_nfe, token)
 
-            # 1) internamento (NF-e)
+            # 1) internamento -> itens da nota
+            itens_payload: Dict[str, Any]
             try:
                 r2 = sess.get(url_capa, timeout=70, allow_redirects=True)
                 if r2.status_code != 200:
@@ -813,7 +769,12 @@ def extrato_produto(
                     }
                 else:
                     parsed = parse_internamento(r2.text)
-                    itens_payload = {"ok": True, "http_status": r2.status_code, "final_url": r2.url, **parsed}
+                    itens_payload = {
+                        "ok": True,
+                        "http_status": r2.status_code,
+                        "final_url": r2.url,
+                        **parsed,
+                    }
             except Exception as e:
                 itens_payload = {
                     "ok": False,
@@ -827,43 +788,39 @@ def extrato_produto(
                     "diagnostico": {"headers_full_n": 0, "headers_cut_n": 0},
                 }
 
-            # 2) CT-e: cteconsulta recebe CHAVE_NFE e retorna chaves CTe
-            cte_url = ""
+            # 2) cteconsulta -> SOMENTE chaves CTe
             cte_chaves: List[str] = []
+            cte_url = ""
             if buscar_cte == 1:
                 cte_url = _resolver_url_cteconsulta(meta.get("cte_modal_rel") or "")
                 cte_chaves = _buscar_chaves_cte(sess, cte_url)
 
-            # 3) ListGatem (opcional): baixa xml e converte
-            docs: Dict[str, Any] = {}
-            if baixar_docs == 1 and LISTGATEM_BASE:
-                docs["nfe"] = _listgatem_fetch("NFE", chave_nfe)
-                docs["ctes"] = []
-                for cch in cte_chaves:
-                    docs["ctes"].append({"chave_cte": cch, "doc": _listgatem_fetch("CTE", cch)})
+                for c in cte_chaves:
+                    cte_total_set.add(c)
 
             notas_out.append({
                 "chave_nfe": chave_nfe,
                 "internamento_url": url_capa,
                 "cte_url": cte_url,
-                "cte_chaves": cte_chaves,
+                "cte_chaves": cte_chaves,  # <-- agora é só CTE (sem misturar NFE)
                 "itens_da_nota": itens_payload,
-                "documentos": docs,  # <- aqui vem NFE + CTE (ListGatem), quando habilitado
             })
 
+        cte_total = sorted(list(cte_total_set))
+
         return {
-            "ok": True,
-            "user": user,
-            "codi": str(cert.get("codi") or ""),
+            "ok":      True,
+            "user":    user,
+            "codi":    str(cert.get("codi") or ""),
             "empresa": cert.get("empresa") or "",
             "result": {
                 "ok": True,
                 "final_url_extrato": r.url,
                 "token_found": bool(token),
                 "usuario": usuario,
-                "total_notas": len(notas_out),
-                "listgatem_enabled": bool(LISTGATEM_BASE) and baixar_docs == 1,
-                "notas": notas_out,
+                "total_notas_nfe": len(notas_out),
+                "notas_nfe": notas_out,
+                "cte_chaves_total": cte_total,
             },
         }
 
@@ -876,6 +833,7 @@ def extrato_produto(
                 pass
 
 
+# ══════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     uvicorn.run(
         "analise:app",
