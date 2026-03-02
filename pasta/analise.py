@@ -8,17 +8,12 @@ analise.py — FastAPI (Render)
   GET /debitos?user=...&codi=...&incluir_ano_anterior=1
   GET /extrato-produto?user=...&codi=...&url_extrato=...&chave=...
 
-✅ Login: DET → Portal usando mTLS (cert pem/key do Supabase)
-
 🔧 ALTERAÇÃO (somente):
-  - /extrato-produto agora retorna APENAS a tabela "Itens da nota"
-  - E corta em 10 colunas (até "Valor Base Calc. ICMS", que é a 10ª coluna no seu HTML)
-  - Não retorna mais cálculo, nem merge, nem itens_lancamentos.
-
-Obs.: No seu HTML, a seção existe como:
-  <h4 class="table-title"> Itens da nota</h4>
-  ... <table> ... (com as colunas)
-e a 10ª coluna é "Valor Base Calc. ICMS" :contentReference[oaicite:0]{index=0}
+  - /extrato-produto agora:
+      ✅ lê TODAS as NF-e do extrato (tabela)
+      ✅ para cada NF-e: abre internamento e retorna APENAS "Itens da nota"
+      ✅ corta em 10 colunas (até "Valor Base Calc. ICMS")
+      ✅ também abre o cteconsulta.jsp (penúltima coluna) e captura chave(s) de CT-e, se houver
 """
 
 from __future__ import annotations
@@ -34,7 +29,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
 
 from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -62,6 +57,7 @@ URL_PORTAL_HOME_DEFAULT = "https://portalcontribuinte.sefin.ro.gov.br/app/home/?
 URL_CONSULTA_DEBITOS    = "https://portalcontribuinte.sefin.ro.gov.br/app/consultadebitos/"
 URL_CONSULTA_DEBITOS_LISTA = "https://portalcontribuinte.sefin.ro.gov.br/app/consultadebitos/lista.jsp"
 BASE_INTERNAMENTO       = "https://internamentonotas.sefin.ro.gov.br"
+BASE_CONTA_CORRENTE     = "https://portalcontribuinte.sefin.ro.gov.br/app/contacorrente/"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -311,30 +307,129 @@ def consultar_debitos_ano(sess: requests.Session, ano: int) -> Tuple[List[Dict[s
 
 
 # ══════════════════════════════════════════════════════════════════
-# EXTRATO → TOKEN / USUARIO / CHAVE
+# EXTRATO (conta-corrente) → TOKEN / USUARIO / CHAVES NFE / LINK CTE
 # ══════════════════════════════════════════════════════════════════
 def _extrair_token_e_usuario(html_extrato: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Suporta dois formatos:
+      (A) extrato antigo: var TOKEN='...' e "Olá <strong>CPF -"
+      (B) conta corrente: var TOKEN='...' e var CPF_CLIENTE=('...')...
+    """
+    # TOKEN
     m1 = re.search(r"var\s+TOKEN\s*=\s*'([^']+)'", html_extrato)
     token = m1.group(1).strip() if m1 else None
+
+    # Formato antigo (saudação)
     m2 = re.search(r"Ol[áa]\s*<strong>\s*([0-9]{11})\s*-", html_extrato, flags=re.I)
-    usuario = m2.group(1).strip() if m2 else None
-    return token, usuario
+    if m2:
+        return token, m2.group(1).strip()
+
+    # Formato conta corrente: CPF_CLIENTE
+    m3 = re.search(r"var\s+CPF_CLIENTE\s*=\s*\(\s*'([^']*)'\s*\|\|\s*''\s*\)", html_extrato)
+    if m3:
+        cpf = re.sub(r"\D", "", m3.group(1) or "")
+        if cpf:
+            return token, cpf
+
+    return token, None
 
 
-def _extrair_chaves_nfe(html_extrato: str) -> List[str]:
-    chaves = re.findall(r"\b\d{44}\b", html_extrato)
-    seen: set = set()
+def _extrair_notas_do_extrato_contacorrente(soup: BeautifulSoup) -> List[Dict[str, Any]]:
+    """
+    Extrai todas as NF-e exibidas na tabela do extrato da conta corrente.
+
+    - chave_nfe: vem do data-chave (link do extrato) OU da primeira <td> da linha
+    - cte_modal_rel: vem do onclick abrirModal('cteconsulta.jsp?chave=...')
+
+    No HTML:
+      <a class="abrir-cte" data-chave="...." onclick="abrirCapaInternamento(this)">Exibir</a>
+      <a onclick="abrirModal('cteconsulta.jsp?chave=....'); return false;">Exibir</a>
+    """
+    notas: List[Dict[str, Any]] = []
+
+    # pega todas as linhas e tenta achar a chave principal
+    for tr in soup.find_all("tr"):
+        chave_nfe = None
+        a_extrato = tr.find("a", {"class": "abrir-cte"})
+        if a_extrato:
+            chave_nfe = (a_extrato.get("data-chave") or "").strip()
+
+        if not chave_nfe:
+            tds = tr.find_all("td")
+            if tds:
+                t0 = (tds[0].get_text(" ", strip=True) or "").strip()
+                if re.fullmatch(r"\d{44}", t0):
+                    chave_nfe = t0
+
+        if not chave_nfe or not re.fullmatch(r"\d{44}", chave_nfe):
+            continue
+
+        # tenta capturar o link do modal de CTE na mesma linha
+        cte_modal_rel = ""
+        for a in tr.find_all("a"):
+            onclick = a.get("onclick") or ""
+            m = re.search(r"abrirModal\(\s*'([^']*cteconsulta\.jsp\?chave=\d{44}[^']*)'\s*\)", onclick)
+            if m:
+                cte_modal_rel = m.group(1).strip()
+                break
+
+        notas.append({
+            "chave_nfe": chave_nfe,
+            "cte_modal_rel": cte_modal_rel,  # relativo (cteconsulta.jsp?chave=...)
+        })
+
+    # dedup mantendo ordem
+    seen = set()
     out = []
-    for c in chaves:
-        if c not in seen:
-            seen.add(c)
-            out.append(c)
+    for n in notas:
+        k = n["chave_nfe"]
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(n)
     return out
 
 
 def _url_capa_internamento(usuario: str, chave: str, token: Optional[str]) -> str:
     base = f"{BASE_INTERNAMENTO}/capa_internamentos/{usuario}/{chave}"
     return base + "?token=" + requests.utils.quote(token, safe="") if token else base
+
+
+def _resolver_url_cteconsulta(url_extrato_clean: str, rel: str) -> str:
+    """
+    rel normalmente é "cteconsulta.jsp?chave=..."
+    A página é /app/contacorrente/extrato.jsp...
+    """
+    if not rel:
+        return ""
+    if rel.startswith("http"):
+        return rel
+    # força base da conta corrente para evitar urljoin estranho com query
+    return requests.compat.urljoin(BASE_CONTA_CORRENTE, rel)
+
+
+def _buscar_chaves_cte(sess: requests.Session, url_cteconsulta: str) -> List[str]:
+    """
+    Abre o cteconsulta.jsp e tenta extrair chaves (44 dígitos).
+    Pode retornar vazio quando não há CTe.
+    """
+    if not url_cteconsulta:
+        return []
+    try:
+        r = sess.get(url_cteconsulta, timeout=45, allow_redirects=True)
+        if r.status_code != 200:
+            return []
+        chaves = re.findall(r"\b\d{44}\b", r.text or "")
+        # dedup
+        seen = set()
+        out = []
+        for c in chaves:
+            if c not in seen:
+                seen.add(c)
+                out.append(c)
+        return out
+    except Exception:
+        return []
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -355,26 +450,10 @@ def _norm_text(text: str) -> str:
 
 
 def _limpar_header(h: str) -> str:
-    # deixa bonito (remove múltiplos espaços e tira "ou" quebrado)
-    h = re.sub(r"\s+", " ", (h or "").strip())
-    return h
+    return re.sub(r"\s+", " ", (h or "").strip())
 
 
 def _parse_itens_da_nota_primeiras_10_colunas(soup: BeautifulSoup) -> Dict[str, Any]:
-    """
-    Localiza a seção "Itens da nota" e retorna somente as 10 primeiras colunas:
-      1 Item
-      2 Descrição
-      3 O/CST ou O/CSOSN
-      4 CFOP
-      5 CEST
-      6 NCM
-      7 Valor Base Calc. ST
-      8 Valor ICMS ST
-      9 Valor ICMS UF Dest.
-     10 Valor Base Calc. ICMS
-    (No seu HTML isso aparece exatamente no thead) :contentReference[oaicite:1]{index=1}
-    """
     # acha o H4 da seção
     h4 = None
     for x in soup.find_all(["h4", "h3", "h2"]):
@@ -418,17 +497,13 @@ def _parse_itens_da_nota_primeiras_10_colunas(soup: BeautifulSoup) -> Dict[str, 
 
         cols_cut = cols_full[:10]
 
-        # valida linha: primeiro campo precisa ser item numérico
         item0 = (cols_cut[0].strip() if cols_cut else "")
         if not re.fullmatch(r"\d+", item0 or ""):
             continue
 
         row = {"cols_raw": cols_cut}
         for i, h in enumerate(headers_cut):
-            if i < len(cols_cut):
-                row[h] = cols_cut[i].strip() or None
-            else:
-                row[h] = None
+            row[h] = (cols_cut[i].strip() if i < len(cols_cut) else None) or None
 
         itens.append(row)
 
@@ -583,13 +658,25 @@ def extrato_produto(
     codi:        str = Query(...),
     url_extrato: str = Query(...),
     chave:       str = Query(""),
+    max_notas:   int = Query(60),
+    buscar_cte:  int = Query(1),
 ):
+    """
+    - Se 'chave' vier preenchida: processa só ela.
+    - Se não vier: pega TODAS as chaves NFe da tabela do extrato.
+    - Para cada chave: abre capa_internamentos e retorna apenas "Itens da nota" (10 colunas).
+    - Se buscar_cte=1: abre também cteconsulta.jsp e captura chaves (44 dígitos).
+    """
     if not user or "@" not in user:
         raise HTTPException(400, "user inválido.")
     if not codi:
         raise HTTPException(400, "codi obrigatório.")
     if not url_extrato.startswith("http"):
         raise HTTPException(400, "url_extrato deve começar com http/https.")
+    if max_notas < 1:
+        max_notas = 1
+    if max_notas > 200:
+        max_notas = 200
 
     certs = carregar_certificados(user)
     cert  = selecionar_cert_por_codi(certs, codi)
@@ -605,39 +692,112 @@ def extrato_produto(
             raise HTTPException(401, "Falha ao abrir Portal (LoginToken/home).")
 
         url_extrato_clean = url_extrato.strip().replace("%22", "").split("#", 1)[0]
-        r = sess.get(url_extrato_clean, timeout=45, allow_redirects=True)
+        r = sess.get(url_extrato_clean, timeout=60, allow_redirects=True)
         if r.status_code != 200:
             raise HTTPException(400, f"Erro ao abrir extrato.jsp: HTTP {r.status_code}")
 
         token, usuario = _extrair_token_e_usuario(r.text)
         if not usuario:
-            raise HTTPException(400, "Não consegui extrair USUARIO/CPF do extrato.jsp.")
+            raise HTTPException(400, "Não consegui extrair USUARIO/CPF do extrato.jsp (conta corrente).")
 
-        chaves     = _extrair_chaves_nfe(r.text)
-        chave_alvo = chave.strip() or (chaves[0] if chaves else "")
-        if not chave_alvo:
-            raise HTTPException(400, "Não encontrei chave NFe (44 dígitos) no extrato.jsp.")
+        soup_extrato = BeautifulSoup(r.text, "lxml")
+        notas_meta = _extrair_notas_do_extrato_contacorrente(soup_extrato)
 
-        url_capa = _url_capa_internamento(usuario, chave_alvo, token)
-        r2 = sess.get(url_capa, timeout=60, allow_redirects=True)
-        if r2.status_code != 200:
-            raise HTTPException(400, f"Falha ao abrir internamento: HTTP {r2.status_code}")
+        # se veio "chave", filtra
+        chave = (chave or "").strip()
+        if chave:
+            if not re.fullmatch(r"\d{44}", chave):
+                raise HTTPException(400, "chave inválida: deve ter 44 dígitos.")
+            # mantém somente a escolhida (se não existir na tabela, ainda tenta processar)
+            found = [n for n in notas_meta if n["chave_nfe"] == chave]
+            notas_meta = found if found else [{"chave_nfe": chave, "cte_modal_rel": ""}]
 
-        parsed = parse_internamento(r2.text)
+        if not notas_meta:
+            return {
+                "ok": True,
+                "user": user,
+                "codi": str(cert.get("codi") or ""),
+                "empresa": cert.get("empresa") or "",
+                "result": {
+                    "ok": True,
+                    "final_url_extrato": r.url,
+                    "token_found": bool(token),
+                    "usuario": usuario,
+                    "total_notas": 0,
+                    "notas": [],
+                }
+            }
 
-        # 🔥 retorno agora só com a tabela "Itens da nota" (10 colunas)
+        notas_meta = notas_meta[:max_notas]
+
+        notas_out: List[Dict[str, Any]] = []
+        for meta in notas_meta:
+            chave_nfe = meta["chave_nfe"]
+            url_capa = _url_capa_internamento(usuario, chave_nfe, token)
+
+            # 1) internamento -> itens da nota
+            itens_payload: Dict[str, Any]
+            try:
+                r2 = sess.get(url_capa, timeout=70, allow_redirects=True)
+                if r2.status_code != 200:
+                    itens_payload = {
+                        "ok": False,
+                        "http_status": r2.status_code,
+                        "final_url": r2.url,
+                        "tabela_encontrada": False,
+                        "motivo": f"Falha ao abrir internamento: HTTP {r2.status_code}",
+                        "headers": [],
+                        "itens": [],
+                        "totais": {"qtd_linhas": 0, "qtd_colunas": 0},
+                        "diagnostico": {"headers_full_n": 0, "headers_cut_n": 0},
+                    }
+                else:
+                    parsed = parse_internamento(r2.text)
+                    itens_payload = {
+                        "ok": True,
+                        "http_status": r2.status_code,
+                        "final_url": r2.url,
+                        **parsed,
+                    }
+            except Exception as e:
+                itens_payload = {
+                    "ok": False,
+                    "http_status": None,
+                    "final_url": url_capa,
+                    "tabela_encontrada": False,
+                    "motivo": f"Erro ao abrir/parsear internamento: {e}",
+                    "headers": [],
+                    "itens": [],
+                    "totais": {"qtd_linhas": 0, "qtd_colunas": 0},
+                    "diagnostico": {"headers_full_n": 0, "headers_cut_n": 0},
+                }
+
+            # 2) cteconsulta -> chaves CTe
+            cte_chaves: List[str] = []
+            if buscar_cte == 1:
+                url_cte = _resolver_url_cteconsulta(url_extrato_clean, meta.get("cte_modal_rel") or "")
+                cte_chaves = _buscar_chaves_cte(sess, url_cte)
+
+            notas_out.append({
+                "chave_nfe": chave_nfe,
+                "internamento_url": url_capa,
+                "cte_url": _resolver_url_cteconsulta(url_extrato_clean, meta.get("cte_modal_rel") or "") if buscar_cte == 1 else "",
+                "cte_chaves": cte_chaves,
+                "itens_da_nota": itens_payload,
+            })
+
         return {
             "ok":      True,
             "user":    user,
             "codi":    str(cert.get("codi") or ""),
             "empresa": cert.get("empresa") or "",
             "result": {
-                "ok":          True,
-                "final_url":   r2.url,
+                "ok": True,
+                "final_url_extrato": r.url,
                 "token_found": bool(token),
-                "usuario":     usuario,
-                "chave":       chave_alvo,
-                **parsed,
+                "usuario": usuario,
+                "total_notas": len(notas_out),
+                "notas": notas_out,
             },
         }
 
