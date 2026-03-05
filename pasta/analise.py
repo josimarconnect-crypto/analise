@@ -16,9 +16,7 @@ analise.py — FastAPI (Render)
   ✅ Retorna também lista agregada de CT-e do extrato
 
 ✅ UPDATE (pedido do Josimar):
-  - Quando "Valor Base Calc. ICMS" vier "0,00", o backend substitui por:
-      1) "Valor Sub Total (BC-01)" (se > 0)
-      2) "Valor Total (BC-02)" (se > 0)
+  - "Valor Base Calc. ICMS" SEMPRE recebe o valor da coluna 22 (BC-01)
 """
 
 from __future__ import annotations
@@ -79,25 +77,6 @@ if not logger.handlers:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-# ══════════════════════════════════════════════════════════════════
-# ✅ HELPERS (pt-BR) — usados no ajuste do BC ICMS
-# ══════════════════════════════════════════════════════════════════
-def _to_float_br(v: Any) -> float:
-    if v is None:
-        return 0.0
-    s = str(v).strip()
-    if not s:
-        return 0.0
-    s = s.replace(".", "").replace(",", ".")
-    try:
-        return float(s)
-    except Exception:
-        return 0.0
-
-def _is_zeroish_br(v: Any) -> bool:
-    return _to_float_br(v) <= 1e-9
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -335,11 +314,6 @@ def consultar_debitos_ano(sess: requests.Session, ano: int) -> Tuple[List[Dict[s
 # EXTRATO → TOKEN / USUARIO / CHAVES NFE / LINK CTE
 # ══════════════════════════════════════════════════════════════════
 def _extrair_token_e_usuario(html_extrato: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Suporta dois formatos:
-      (A) extrato antigo: var TOKEN='...' e "Olá <strong>CPF -"
-      (B) conta corrente: var TOKEN='...' e var CPF_CLIENTE=('...')...
-    """
     m1 = re.search(r"var\s+TOKEN\s*=\s*'([^']+)'", html_extrato)
     token = m1.group(1).strip() if m1 else None
 
@@ -357,28 +331,16 @@ def _extrair_token_e_usuario(html_extrato: str) -> Tuple[Optional[str], Optional
 
 
 def _extrair_notas_do_extrato_contacorrente(soup: BeautifulSoup) -> List[Dict[str, Any]]:
-    """
-    Extrai TODAS as NF-e exibidas na tabela do extrato.
-
-    - chave_nfe: tenta:
-        1) <a class="abrir-cte" data-chave="...">
-        2) primeira <td> da linha
-        3) qualquer <td>/<a> da linha com 44 dígitos (fallback)
-    - cte_modal_rel: onclick abrirModal('cteconsulta.jsp?chave=...') na mesma linha
-    """
     notas: List[Dict[str, Any]] = []
-
     for tr in soup.find_all("tr"):
         chave_nfe = None
 
-        # 1) data-chave
         a_extrato = tr.find("a", {"class": "abrir-cte"})
         if a_extrato:
             v = (a_extrato.get("data-chave") or "").strip()
             if re.fullmatch(r"\d{44}", v):
                 chave_nfe = v
 
-        # 2) primeira coluna
         if not chave_nfe:
             tds = tr.find_all("td")
             if tds:
@@ -386,7 +348,6 @@ def _extrair_notas_do_extrato_contacorrente(soup: BeautifulSoup) -> List[Dict[st
                 if re.fullmatch(r"\d{44}", t0):
                     chave_nfe = t0
 
-        # 3) fallback: qualquer 44 dígitos na linha
         if not chave_nfe:
             line_txt = tr.get_text(" ", strip=True) or ""
             m = re.search(r"\b(\d{44})\b", line_txt)
@@ -396,7 +357,6 @@ def _extrair_notas_do_extrato_contacorrente(soup: BeautifulSoup) -> List[Dict[st
         if not chave_nfe or not re.fullmatch(r"\d{44}", chave_nfe):
             continue
 
-        # captura link do modal de CTE na mesma linha
         cte_modal_rel = ""
         for a in tr.find_all("a"):
             onclick = a.get("onclick") or ""
@@ -407,7 +367,6 @@ def _extrair_notas_do_extrato_contacorrente(soup: BeautifulSoup) -> List[Dict[st
 
         notas.append({"chave_nfe": chave_nfe, "cte_modal_rel": cte_modal_rel})
 
-    # dedup mantendo ordem
     seen = set()
     out = []
     for n in notas:
@@ -440,10 +399,6 @@ def _extrair_chave_da_query(url: str) -> Optional[str]:
 
 
 def _buscar_chaves_cte(sess: requests.Session, url_cteconsulta: str) -> List[str]:
-    """
-    Abre o cteconsulta.jsp e extrai SOMENTE chaves de CT-e.
-    Remove a chave da NF-e consultada (porque o HTML costuma repetir ela).
-    """
     if not url_cteconsulta:
         return []
 
@@ -491,47 +446,38 @@ def _limpar_header(h: str) -> str:
     return re.sub(r"\s+", " ", (h or "").strip())
 
 
-def _apply_bc_icms_fallback_row(row: Dict[str, Any], headers_cut: List[str], cols_cut: List[str]) -> None:
+def _force_bc_icms_from_col22(row: Dict[str, Any], headers_cut: List[str], cols_cut: List[str]) -> None:
     """
-    ✅ Ajuste pedido:
-    Se "Valor Base Calc. ICMS" for 0,00, sobrescreve com:
-      1) "Valor Sub Total (BC-01)" se > 0
-      2) "Valor Total (BC-02)" se > 0
-    Também atualiza cols_raw na posição correta.
+    ✅ Regra fixa:
+    "Valor Base Calc. ICMS" = SEMPRE o valor da COLUNA 22 (BC-01)
+
+    Preferência:
+      1) Se existir header "Valor Sub Total (BC-01)" -> usa esse valor
+      2) Senão -> usa o índice 21 (coluna 22 no humano; 0-based = 21)
+    E também atualiza cols_raw na posição do header "Valor Base Calc. ICMS".
     """
-    key_bc = "Valor Base Calc. ICMS"
-    key_bc01 = "Valor Sub Total (BC-01)"
-    key_bc02 = "Valor Total (BC-02)"
+    key_target = "Valor Base Calc. ICMS"
+    key_source = "Valor Sub Total (BC-01)"
 
-    if key_bc not in row:
+    # pega valor fonte
+    if key_source in row:
+        src_val = row.get(key_source)
+    else:
+        src_val = cols_cut[21].strip() if len(cols_cut) > 21 else None
+
+    if src_val is None:
         return
 
-    bc = row.get(key_bc)
-    if not _is_zeroish_br(bc):
-        return
+    # seta no dicionário
+    row[key_target] = (str(src_val).strip() if src_val is not None else None) or None
 
-    v01 = row.get(key_bc01)
-    if not _is_zeroish_br(v01):
-        row[key_bc] = (str(v01).strip() if v01 is not None else v01)
-        # Atualiza cols_cut
-        try:
-            i_bc = headers_cut.index(key_bc)
-            if i_bc < len(cols_cut):
-                cols_cut[i_bc] = row[key_bc]
-        except ValueError:
-            pass
-        return
-
-    v02 = row.get(key_bc02)
-    if not _is_zeroish_br(v02):
-        row[key_bc] = (str(v02).strip() if v02 is not None else v02)
-        try:
-            i_bc = headers_cut.index(key_bc)
-            if i_bc < len(cols_cut):
-                cols_cut[i_bc] = row[key_bc]
-        except ValueError:
-            pass
-        return
+    # e mantém consistência no cols_raw na posição correta do target
+    try:
+        i_target = headers_cut.index(key_target)
+        if i_target < len(cols_cut):
+            cols_cut[i_target] = row[key_target] or ""
+    except ValueError:
+        pass
 
 
 def _parse_itens_da_nota_primeiras_10_colunas(soup: BeautifulSoup) -> Dict[str, Any]:
@@ -564,9 +510,7 @@ def _parse_itens_da_nota_primeiras_10_colunas(soup: BeautifulSoup) -> Dict[str, 
 
     ths = table.find_all("th")
     headers_full = [_limpar_header(th.get_text(" ", strip=True)) for th in ths]
-
-    # ⚠️ você está cortando 22 colunas (como no seu JSON). Mantido.
-    headers_cut = headers_full[:22]
+    headers_cut = headers_full[:22]  # mantido do seu código
 
     itens: List[Dict[str, Any]] = []
     for tr in table.find_all("tr"):
@@ -588,12 +532,10 @@ def _parse_itens_da_nota_primeiras_10_colunas(soup: BeautifulSoup) -> Dict[str, 
         for i, h in enumerate(headers_cut):
             row[h] = (cols_cut[i].strip() if i < len(cols_cut) else None) or None
 
-        # ✅ APLICA A CORREÇÃO DO BC ICMS (pedido)
-        _apply_bc_icms_fallback_row(row, headers_cut, cols_cut)
+        # ✅ AQUI: força BC ICMS sempre = col 22 (BC-01)
+        _force_bc_icms_from_col22(row, headers_cut, cols_cut)
 
-        # garante consistência do cols_raw depois do ajuste
         row["cols_raw"] = cols_cut
-
         itens.append(row)
 
     return {
@@ -620,7 +562,7 @@ def parse_internamento(html_intern: str) -> Dict[str, Any]:
 # ══════════════════════════════════════════════════════════════════
 # APP FASTAPI
 # ══════════════════════════════════════════════════════════════════
-app = FastAPI(title="analise — Extrato (NFe + CTe separados) + Itens (BC ICMS fix)")
+app = FastAPI(title="analise — Extrato (NFe + CTe separados) + Itens (BC ICMS = col 22)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -750,13 +692,6 @@ def extrato_produto(
     max_notas:   int = Query(200),
     buscar_cte:  int = Query(1),
 ):
-    """
-    - Se 'chave' vier preenchida: processa só ela (NF-e).
-    - Se não vier: pega TODAS as chaves NF-e da listagem do extrato.
-    - Para cada NF-e: abre internamento e retorna "Itens da nota".
-    - Se buscar_cte=1: abre também cteconsulta.jsp e captura SOMENTE chaves CT-e.
-    - Retorna também cte_chaves_total agregado (único) do extrato.
-    """
     if not user or "@" not in user:
         raise HTTPException(400, "user inválido.")
     if not codi:
@@ -793,7 +728,6 @@ def extrato_produto(
         soup_extrato = BeautifulSoup(r.text, "lxml")
         notas_meta = _extrair_notas_do_extrato_contacorrente(soup_extrato)
 
-        # se veio "chave", filtra
         chave = (chave or "").strip()
         if chave:
             if not re.fullmatch(r"\d{44}", chave):
@@ -827,7 +761,6 @@ def extrato_produto(
             chave_nfe = meta["chave_nfe"]
             url_capa = _url_capa_internamento(usuario, chave_nfe, token)
 
-            # 1) internamento -> itens da nota
             itens_payload: Dict[str, Any]
             try:
                 r2 = sess.get(url_capa, timeout=70, allow_redirects=True)
@@ -864,13 +797,11 @@ def extrato_produto(
                     "diagnostico": {"headers_full_n": 0, "headers_cut_n": 0},
                 }
 
-            # 2) cteconsulta -> SOMENTE chaves CTe
             cte_chaves: List[str] = []
             cte_url = ""
             if buscar_cte == 1:
                 cte_url = _resolver_url_cteconsulta(meta.get("cte_modal_rel") or "")
                 cte_chaves = _buscar_chaves_cte(sess, cte_url)
-
                 for c in cte_chaves:
                     cte_total_set.add(c)
 
@@ -878,7 +809,7 @@ def extrato_produto(
                 "chave_nfe": chave_nfe,
                 "internamento_url": url_capa,
                 "cte_url": cte_url,
-                "cte_chaves": cte_chaves,  # <-- agora é só CTE (sem misturar NFE)
+                "cte_chaves": cte_chaves,
                 "itens_da_nota": itens_payload,
             })
 
