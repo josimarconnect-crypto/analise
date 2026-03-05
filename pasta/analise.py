@@ -95,7 +95,7 @@ def carregar_certificados(user_filter: str) -> List[Dict[str, Any]]:
         "select": 'id,pem,key,empresa,codi,user,vencimento,"cnpj/cpf"',
         "user":   f"eq.{user_filter}",
         "order":  "id.desc",
-        "limit":  "100",
+        "limit":  "1000",
     }
     r = requests.get(url, headers=supabase_headers(), params=params, timeout=30)
     if r.status_code >= 300:
