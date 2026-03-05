@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """
 analise.py — FastAPI (Render)
@@ -15,6 +14,11 @@ analise.py — FastAPI (Render)
       - abre internamento e retorna SOMENTE "Itens da nota" (10 colunas)
       - abre cteconsulta.jsp e retorna SOMENTE chaves de CT-e (sem misturar NF-e)
   ✅ Retorna também lista agregada de CT-e do extrato
+
+✅ UPDATE (pedido do Josimar):
+  - Quando "Valor Base Calc. ICMS" vier "0,00", o backend substitui por:
+      1) "Valor Sub Total (BC-01)" (se > 0)
+      2) "Valor Total (BC-02)" (se > 0)
 """
 
 from __future__ import annotations
@@ -75,6 +79,25 @@ if not logger.handlers:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ══════════════════════════════════════════════════════════════════
+# ✅ HELPERS (pt-BR) — usados no ajuste do BC ICMS
+# ══════════════════════════════════════════════════════════════════
+def _to_float_br(v: Any) -> float:
+    if v is None:
+        return 0.0
+    s = str(v).strip()
+    if not s:
+        return 0.0
+    s = s.replace(".", "").replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+def _is_zeroish_br(v: Any) -> bool:
+    return _to_float_br(v) <= 1e-9
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -448,7 +471,7 @@ def _buscar_chaves_cte(sess: requests.Session, url_cteconsulta: str) -> List[str
 
 
 # ══════════════════════════════════════════════════════════════════
-# PARSER: SOMENTE "ITENS DA NOTA" (10 colunas)
+# PARSER: "ITENS DA NOTA"
 # ══════════════════════════════════════════════════════════════════
 def _norm_text(text: str) -> str:
     t = re.sub(r"\s+", " ", (text or "").strip().lower())
@@ -466,6 +489,49 @@ def _norm_text(text: str) -> str:
 
 def _limpar_header(h: str) -> str:
     return re.sub(r"\s+", " ", (h or "").strip())
+
+
+def _apply_bc_icms_fallback_row(row: Dict[str, Any], headers_cut: List[str], cols_cut: List[str]) -> None:
+    """
+    ✅ Ajuste pedido:
+    Se "Valor Base Calc. ICMS" for 0,00, sobrescreve com:
+      1) "Valor Sub Total (BC-01)" se > 0
+      2) "Valor Total (BC-02)" se > 0
+    Também atualiza cols_raw na posição correta.
+    """
+    key_bc = "Valor Base Calc. ICMS"
+    key_bc01 = "Valor Sub Total (BC-01)"
+    key_bc02 = "Valor Total (BC-02)"
+
+    if key_bc not in row:
+        return
+
+    bc = row.get(key_bc)
+    if not _is_zeroish_br(bc):
+        return
+
+    v01 = row.get(key_bc01)
+    if not _is_zeroish_br(v01):
+        row[key_bc] = (str(v01).strip() if v01 is not None else v01)
+        # Atualiza cols_cut
+        try:
+            i_bc = headers_cut.index(key_bc)
+            if i_bc < len(cols_cut):
+                cols_cut[i_bc] = row[key_bc]
+        except ValueError:
+            pass
+        return
+
+    v02 = row.get(key_bc02)
+    if not _is_zeroish_br(v02):
+        row[key_bc] = (str(v02).strip() if v02 is not None else v02)
+        try:
+            i_bc = headers_cut.index(key_bc)
+            if i_bc < len(cols_cut):
+                cols_cut[i_bc] = row[key_bc]
+        except ValueError:
+            pass
+        return
 
 
 def _parse_itens_da_nota_primeiras_10_colunas(soup: BeautifulSoup) -> Dict[str, Any]:
@@ -498,6 +564,8 @@ def _parse_itens_da_nota_primeiras_10_colunas(soup: BeautifulSoup) -> Dict[str, 
 
     ths = table.find_all("th")
     headers_full = [_limpar_header(th.get_text(" ", strip=True)) for th in ths]
+
+    # ⚠️ você está cortando 22 colunas (como no seu JSON). Mantido.
     headers_cut = headers_full[:22]
 
     itens: List[Dict[str, Any]] = []
@@ -505,6 +573,7 @@ def _parse_itens_da_nota_primeiras_10_colunas(soup: BeautifulSoup) -> Dict[str, 
         tds = tr.find_all("td")
         if not tds:
             continue
+
         cols_full = [td.get_text(" ", strip=True) for td in tds]
         if len(cols_full) < 2:
             continue
@@ -518,6 +587,12 @@ def _parse_itens_da_nota_primeiras_10_colunas(soup: BeautifulSoup) -> Dict[str, 
         row = {"cols_raw": cols_cut}
         for i, h in enumerate(headers_cut):
             row[h] = (cols_cut[i].strip() if i < len(cols_cut) else None) or None
+
+        # ✅ APLICA A CORREÇÃO DO BC ICMS (pedido)
+        _apply_bc_icms_fallback_row(row, headers_cut, cols_cut)
+
+        # garante consistência do cols_raw depois do ajuste
+        row["cols_raw"] = cols_cut
 
         itens.append(row)
 
@@ -545,7 +620,7 @@ def parse_internamento(html_intern: str) -> Dict[str, Any]:
 # ══════════════════════════════════════════════════════════════════
 # APP FASTAPI
 # ══════════════════════════════════════════════════════════════════
-app = FastAPI(title="analise — Extrato (NFe + CTe separados) + Itens (10 colunas)")
+app = FastAPI(title="analise — Extrato (NFe + CTe separados) + Itens (BC ICMS fix)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -678,7 +753,7 @@ def extrato_produto(
     """
     - Se 'chave' vier preenchida: processa só ela (NF-e).
     - Se não vier: pega TODAS as chaves NF-e da listagem do extrato.
-    - Para cada NF-e: abre internamento e retorna "Itens da nota" (10 colunas).
+    - Para cada NF-e: abre internamento e retorna "Itens da nota".
     - Se buscar_cte=1: abre também cteconsulta.jsp e captura SOMENTE chaves CT-e.
     - Retorna também cte_chaves_total agregado (único) do extrato.
     """
@@ -841,4 +916,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.getenv("PORT", "10000")),
         reload=False,
-    ) 
+    )
