@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 """
 analise.py — FastAPI (Render)
@@ -11,12 +12,9 @@ analise.py — FastAPI (Render)
 🔧 /extrato-produto:
   ✅ Lê TODAS as chaves de NF-e na listagem do extrato (conta corrente)
   ✅ Para cada NF-e:
-      - abre internamento e retorna SOMENTE "Itens da nota" (agora 22 colunas, inclui BC-02)
+      - abre internamento e retorna SOMENTE "Itens da nota" (10 colunas)
       - abre cteconsulta.jsp e retorna SOMENTE chaves de CT-e (sem misturar NF-e)
   ✅ Retorna também lista agregada de CT-e do extrato
-
-✅ Alteração solicitada:
-  - "Itens da nota" agora corta em 22 colunas (antes 10), para incluir a coluna 22 (BC-02).
 """
 
 from __future__ import annotations
@@ -62,14 +60,6 @@ URL_CONSULTA_DEBITOS_LISTA = "https://portalcontribuinte.sefin.ro.gov.br/app/con
 
 BASE_INTERNAMENTO       = "https://internamentonotas.sefin.ro.gov.br"
 BASE_CONTA_CORRENTE     = "https://portalcontribuinte.sefin.ro.gov.br/app/contacorrente/"
-
-# ✅ Quantidade de colunas retornadas da tabela "Itens da nota"
-#    Agora 22 para incluir a coluna 22 (BC-02).
-INTERNAMENTO_ITENS_COLS = int(os.getenv("INTERNAMENTO_ITENS_COLS", "22").strip() or "22")
-if INTERNAMENTO_ITENS_COLS < 10:
-    INTERNAMENTO_ITENS_COLS = 10
-if INTERNAMENTO_ITENS_COLS > 40:
-    INTERNAMENTO_ITENS_COLS = 40
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -458,7 +448,7 @@ def _buscar_chaves_cte(sess: requests.Session, url_cteconsulta: str) -> List[str
 
 
 # ══════════════════════════════════════════════════════════════════
-# PARSER: SOMENTE "ITENS DA NOTA" (agora 22 colunas p/ incluir BC-02)
+# PARSER: SOMENTE "ITENS DA NOTA" (10 colunas)
 # ══════════════════════════════════════════════════════════════════
 def _norm_text(text: str) -> str:
     t = re.sub(r"\s+", " ", (text or "").strip().lower())
@@ -478,7 +468,7 @@ def _limpar_header(h: str) -> str:
     return re.sub(r"\s+", " ", (h or "").strip())
 
 
-def _parse_itens_da_nota_primeiras_n_colunas(soup: BeautifulSoup, n_cols: int) -> Dict[str, Any]:
+def _parse_itens_da_nota_primeiras_10_colunas(soup: BeautifulSoup) -> Dict[str, Any]:
     h4 = None
     for x in soup.find_all(["h4", "h3", "h2"]):
         if "itens da nota" in _norm_text(x.get_text(" ", strip=True)):
@@ -508,7 +498,7 @@ def _parse_itens_da_nota_primeiras_n_colunas(soup: BeautifulSoup, n_cols: int) -
 
     ths = table.find_all("th")
     headers_full = [_limpar_header(th.get_text(" ", strip=True)) for th in ths]
-    headers_cut = headers_full[:n_cols]
+    headers_cut = headers_full[:22]
 
     itens: List[Dict[str, Any]] = []
     for tr in table.find_all("tr"):
@@ -519,7 +509,7 @@ def _parse_itens_da_nota_primeiras_n_colunas(soup: BeautifulSoup, n_cols: int) -
         if len(cols_full) < 2:
             continue
 
-        cols_cut = cols_full[:n_cols]
+        cols_cut = cols_full[:22]
 
         item0 = (cols_cut[0].strip() if cols_cut else "")
         if not re.fullmatch(r"\d+", item0 or ""):
@@ -549,13 +539,13 @@ def _parse_itens_da_nota_primeiras_n_colunas(soup: BeautifulSoup, n_cols: int) -
 
 def parse_internamento(html_intern: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html_intern, "lxml")
-    return _parse_itens_da_nota_primeiras_n_colunas(soup, INTERNAMENTO_ITENS_COLS)
+    return _parse_itens_da_nota_primeiras_10_colunas(soup)
 
 
 # ══════════════════════════════════════════════════════════════════
 # APP FASTAPI
 # ══════════════════════════════════════════════════════════════════
-app = FastAPI(title="analise — Extrato (NFe + CTe separados) + Itens (22 colunas incl. BC-02)")
+app = FastAPI(title="analise — Extrato (NFe + CTe separados) + Itens (10 colunas)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -688,7 +678,7 @@ def extrato_produto(
     """
     - Se 'chave' vier preenchida: processa só ela (NF-e).
     - Se não vier: pega TODAS as chaves NF-e da listagem do extrato.
-    - Para cada NF-e: abre internamento e retorna "Itens da nota" (agora 22 colunas, inclui BC-02).
+    - Para cada NF-e: abre internamento e retorna "Itens da nota" (10 colunas).
     - Se buscar_cte=1: abre também cteconsulta.jsp e captura SOMENTE chaves CT-e.
     - Retorna também cte_chaves_total agregado (único) do extrato.
     """
@@ -815,7 +805,6 @@ def extrato_produto(
                 "cte_url": cte_url,
                 "cte_chaves": cte_chaves,  # <-- agora é só CTE (sem misturar NFE)
                 "itens_da_nota": itens_payload,
-                "itens_cols_cut": INTERNAMENTO_ITENS_COLS,  # debug útil
             })
 
         cte_total = sorted(list(cte_total_set))
@@ -833,7 +822,6 @@ def extrato_produto(
                 "total_notas_nfe": len(notas_out),
                 "notas_nfe": notas_out,
                 "cte_chaves_total": cte_total,
-                "itens_cols_cut": INTERNAMENTO_ITENS_COLS,
             },
         }
 
@@ -853,4 +841,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.getenv("PORT", "10000")),
         reload=False,
-    )
+    ) 
