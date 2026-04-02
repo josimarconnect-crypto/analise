@@ -49,6 +49,8 @@ import uvicorn
 # ✅ IMPORT DO MÓDULO SECUNDÁRIO
 from parcelamento import router as parcelamento_router
 
+PYTHON_VERSION=3.11.11
+
 
 # ══════════════════════════════════════════════════════════════════
 # CONFIG
