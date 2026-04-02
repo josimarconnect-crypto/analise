@@ -8,13 +8,6 @@ analise.py — FastAPI (Render)
   GET /debitos?user=...&codi=...&incluir_ano_anterior=1
   GET /extrato-produto?user=...&codi=...&url_extrato=...&chave=...
 
-✅ Rotas importadas do parcelamento.py:
-  GET  /integra-parcelamento/health
-  POST /integra-parcelamento/certificado/converter
-  POST /integra-parcelamento/auth
-  POST /integra-parcelamento/parcelamentos/consultar
-  POST /integra-parcelamento/parcelamentos/emitir
-
 🔧 /extrato-produto:
   ✅ Lê TODAS as chaves de NF-e na listagem do extrato (conta corrente)
   ✅ Para cada NF-e:
@@ -45,11 +38,6 @@ from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
-
-# ✅ IMPORT DO MÓDULO SECUNDÁRIO
-from parcelamento import router as parcelamento_router
-
-PYTHON_VERSION=3.11.11
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -471,6 +459,7 @@ def _force_bc_icms_from_col22(row: Dict[str, Any], headers_cut: List[str], cols_
     key_target = "Valor Base Calc. ICMS"
     key_source = "Valor Sub Total (BC-01)"
 
+    # pega valor fonte
     if key_source in row:
         src_val = row.get(key_source)
     else:
@@ -479,8 +468,10 @@ def _force_bc_icms_from_col22(row: Dict[str, Any], headers_cut: List[str], cols_
     if src_val is None:
         return
 
+    # seta no dicionário
     row[key_target] = (str(src_val).strip() if src_val is not None else None) or None
 
+    # e mantém consistência no cols_raw na posição correta do target
     try:
         i_target = headers_cut.index(key_target)
         if i_target < len(cols_cut):
@@ -519,7 +510,7 @@ def _parse_itens_da_nota_primeiras_10_colunas(soup: BeautifulSoup) -> Dict[str, 
 
     ths = table.find_all("th")
     headers_full = [_limpar_header(th.get_text(" ", strip=True)) for th in ths]
-    headers_cut = headers_full[:22]
+    headers_cut = headers_full[:22]  # mantido do seu código
 
     itens: List[Dict[str, Any]] = []
     for tr in table.find_all("tr"):
@@ -541,6 +532,7 @@ def _parse_itens_da_nota_primeiras_10_colunas(soup: BeautifulSoup) -> Dict[str, 
         for i, h in enumerate(headers_cut):
             row[h] = (cols_cut[i].strip() if i < len(cols_cut) else None) or None
 
+        # ✅ AQUI: força BC ICMS sempre = col 22 (BC-01)
         _force_bc_icms_from_col22(row, headers_cut, cols_cut)
 
         row["cols_raw"] = cols_cut
@@ -571,9 +563,6 @@ def parse_internamento(html_intern: str) -> Dict[str, Any]:
 # APP FASTAPI
 # ══════════════════════════════════════════════════════════════════
 app = FastAPI(title="analise — Extrato (NFe + CTe separados) + Itens (BC ICMS = col 22)")
-
-# ✅ INCLUI AS ROTAS DO parcelamento.py
-app.include_router(parcelamento_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -612,20 +601,10 @@ async def global_exception_handler(request: Request, exc: Exception):
 @app.get("/")
 def root():
     return {
-        "ok": True,
+        "ok":      True,
         "service": "analise",
         "date_utc": _now_iso(),
-        "routes": [
-            "/health",
-            "/empresas",
-            "/debitos",
-            "/extrato-produto",
-            "/integra-parcelamento/health",
-            "/integra-parcelamento/certificado/converter",
-            "/integra-parcelamento/auth",
-            "/integra-parcelamento/parcelamentos/consultar",
-            "/integra-parcelamento/parcelamentos/emitir",
-        ],
+        "routes":  ["/health", "/empresas", "/debitos", "/extrato-produto"],
     }
 
 
@@ -657,8 +636,8 @@ def empresas(user: str = Query(...)):
 
 @app.get("/debitos")
 def route_debitos(
-    user: str = Query(...),
-    codi: str = Query(...),
+    user:                str = Query(...),
+    codi:                str = Query(...),
     incluir_ano_anterior: int = Query(1),
 ):
     if not user or "@" not in user:
@@ -667,7 +646,7 @@ def route_debitos(
         raise HTTPException(400, "codi obrigatório.")
 
     certs = carregar_certificados(user)
-    cert = selecionar_cert_por_codi(certs, codi)
+    cert  = selecionar_cert_por_codi(certs, codi)
 
     cert_path = key_path = None
     try:
@@ -688,9 +667,9 @@ def route_debitos(
             all_debs.extend(debs or [])
 
         return {
-            "ok": True,
-            "user": user,
-            "codi": str(cert.get("codi") or ""),
+            "ok":      True,
+            "user":    user,
+            "codi":    str(cert.get("codi") or ""),
             "empresa": (cert.get("empresa") or ""),
             "debitos": all_debs,
         }
@@ -706,12 +685,12 @@ def route_debitos(
 
 @app.get("/extrato-produto")
 def extrato_produto(
-    user: str = Query(...),
-    codi: str = Query(...),
+    user:        str = Query(...),
+    codi:        str = Query(...),
     url_extrato: str = Query(...),
-    chave: str = Query(""),
-    max_notas: int = Query(200),
-    buscar_cte: int = Query(1),
+    chave:       str = Query(""),
+    max_notas:   int = Query(200),
+    buscar_cte:  int = Query(1),
 ):
     if not user or "@" not in user:
         raise HTTPException(400, "user inválido.")
@@ -725,7 +704,7 @@ def extrato_produto(
         max_notas = 500
 
     certs = carregar_certificados(user)
-    cert = selecionar_cert_por_codi(certs, codi)
+    cert  = selecionar_cert_por_codi(certs, codi)
 
     cert_path = key_path = None
     try:
@@ -837,9 +816,9 @@ def extrato_produto(
         cte_total = sorted(list(cte_total_set))
 
         return {
-            "ok": True,
-            "user": user,
-            "codi": str(cert.get("codi") or ""),
+            "ok":      True,
+            "user":    user,
+            "codi":    str(cert.get("codi") or ""),
             "empresa": cert.get("empresa") or "",
             "result": {
                 "ok": True,
