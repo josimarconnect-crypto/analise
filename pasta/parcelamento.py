@@ -5,8 +5,8 @@ integra_parcelamento_api.py
 Módulo secundário para ser importado no app principal (FastAPI/Render).
 
 Funções:
-- Recebe PFX/P12 em base64
-- Converte para cert.pem / key.pem
+- Recebe PFX/P12 em base64 OU PEM/KEY em base64
+- Converte PFX para cert.pem / key.pem quando necessário
 - Retorna cert/key em texto e em base64
 - Autentica na SAPI (mTLS + Basic consumerKey:consumerSecret)
 - Consulta parcelamentos (PARCSN / PEDIDOSPARC163)
@@ -27,7 +27,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import requests
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from cryptography.hazmat.primitives.serialization import (
     Encoding,
     NoEncryption,
@@ -44,8 +44,30 @@ router = APIRouter(prefix="/integra-parcelamento", tags=["Integra Parcelamento"]
 
 
 class CertificadoBase64In(BaseModel):
-    pfx_base64: str = Field(..., description="Arquivo .pfx/.p12 em base64")
-    pfx_password: str = Field(default="", description="Senha do certificado")
+    pfx_base64: str = Field(default="", description="Arquivo .pfx/.p12 em base64")
+    pfx_password: str = Field(default="", description="Senha do certificado PFX/P12")
+    pem_base64: str = Field(default="", description="Certificado PEM em base64")
+    key_base64: str = Field(default="", description="Chave privada PEM em base64")
+
+    @model_validator(mode="after")
+    def validar_origem_certificado(self):
+        has_pfx = bool((self.pfx_base64 or "").strip())
+        has_pem_pair = bool((self.pem_base64 or "").strip() and (self.key_base64 or "").strip())
+
+        if not has_pfx and not has_pem_pair:
+            raise ValueError("Informe pfx_base64 OU pem_base64 + key_base64.")
+
+        if has_pfx and has_pem_pair:
+            # permitido, mas priorizamos PEM/KEY quando vierem ambos
+            return self
+
+        if (self.pem_base64 or "").strip() and not (self.key_base64 or "").strip():
+            raise ValueError("Ao informar pem_base64, informe também key_base64.")
+
+        if (self.key_base64 or "").strip() and not (self.pem_base64 or "").strip():
+            raise ValueError("Ao informar key_base64, informe também pem_base64.")
+
+        return self
 
 
 class AuthIn(CertificadoBase64In):
@@ -131,6 +153,34 @@ def pfx_bytes_to_pem_material(pfx_bytes: bytes, pfx_password: str) -> Dict[str, 
     }
 
 
+def pem_key_b64_to_material(pem_base64: str, key_base64: str) -> Dict[str, str]:
+    cert_pem_bytes = decode_b64_to_bytes(pem_base64)
+    key_pem_bytes = decode_b64_to_bytes(key_base64)
+
+    cert_text = cert_pem_bytes.decode("utf-8", errors="strict")
+    key_text = key_pem_bytes.decode("utf-8", errors="strict")
+
+    if "BEGIN CERTIFICATE" not in cert_text:
+        raise ValueError("pem_base64 não contém um CERTIFICATE PEM válido.")
+
+    if "BEGIN" not in key_text or "PRIVATE KEY" not in key_text:
+        raise ValueError("key_base64 não contém uma PRIVATE KEY PEM válida.")
+
+    return {
+        "cert_pem_text": cert_text,
+        "key_pem_text": key_text,
+        "cert_pem_base64": base64.b64encode(cert_pem_bytes).decode("ascii"),
+        "key_pem_base64": base64.b64encode(key_pem_bytes).decode("ascii"),
+        "chain_pem_text": "",
+        "chain_pem_base64": "",
+        "subject": "",
+        "issuer": "",
+        "serial_number": "",
+        "has_chain": False,
+        "chain_count": 0,
+    }
+
+
 def write_temp_pem_files(cert_pem_text: str, key_pem_text: str) -> Tuple[str, str, str]:
     tmpdir = tempfile.mkdtemp(prefix="serpro_mtls_")
     cert_path = os.path.join(tmpdir, "cert.pem")
@@ -150,19 +200,42 @@ def cleanup_tmpdir(tmpdir: Optional[str]) -> None:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def get_tokens_from_pfx_base64(
+def build_pem_material(
+    pfx_base64: str = "",
+    pfx_password: str = "",
+    pem_base64: str = "",
+    key_base64: str = "",
+) -> Dict[str, str]:
+    if (pem_base64 or "").strip() and (key_base64 or "").strip():
+        return pem_key_b64_to_material(pem_base64, key_base64)
+
+    if (pfx_base64 or "").strip():
+        pfx_bytes = decode_b64_to_bytes(pfx_base64)
+        return pfx_bytes_to_pem_material(pfx_bytes, pfx_password)
+
+    raise ValueError("Informe pfx_base64 OU pem_base64 + key_base64.")
+
+
+def get_tokens_from_cert_base64(
     consumer_key: str,
     consumer_secret: str,
-    pfx_base64: str,
-    pfx_password: str,
+    *,
+    pfx_base64: str = "",
+    pfx_password: str = "",
+    pem_base64: str = "",
+    key_base64: str = "",
     role_type: str = "TERCEIROS",
     timeout: int = 60,
 ) -> Tuple[SerproTokens, Dict[str, str]]:
     if not consumer_key or not consumer_secret:
         raise ValueError("Preencha consumer_key e consumer_secret.")
 
-    pfx_bytes = decode_b64_to_bytes(pfx_base64)
-    pem_material = pfx_bytes_to_pem_material(pfx_bytes, pfx_password)
+    pem_material = build_pem_material(
+        pfx_base64=pfx_base64,
+        pfx_password=pfx_password,
+        pem_base64=pem_base64,
+        key_base64=key_base64,
+    )
 
     cert_path = None
     key_path = None
@@ -210,6 +283,24 @@ def get_tokens_from_pfx_base64(
 
     finally:
         cleanup_tmpdir(tmpdir)
+
+
+def get_tokens_from_pfx_base64(
+    consumer_key: str,
+    consumer_secret: str,
+    pfx_base64: str,
+    pfx_password: str,
+    role_type: str = "TERCEIROS",
+    timeout: int = 60,
+) -> Tuple[SerproTokens, Dict[str, str]]:
+    return get_tokens_from_cert_base64(
+        consumer_key=consumer_key,
+        consumer_secret=consumer_secret,
+        pfx_base64=pfx_base64,
+        pfx_password=pfx_password,
+        role_type=role_type,
+        timeout=timeout,
+    )
 
 
 def build_body(
@@ -322,8 +413,12 @@ def health():
 @router.post("/certificado/converter")
 def converter_certificado(payload: CertificadoBase64In):
     try:
-        pfx_bytes = decode_b64_to_bytes(payload.pfx_base64)
-        pem_material = pfx_bytes_to_pem_material(pfx_bytes, payload.pfx_password)
+        pem_material = build_pem_material(
+            pfx_base64=payload.pfx_base64,
+            pfx_password=payload.pfx_password,
+            pem_base64=payload.pem_base64,
+            key_base64=payload.key_base64,
+        )
         return {
             "ok": True,
             "certificado": pem_material,
@@ -335,11 +430,13 @@ def converter_certificado(payload: CertificadoBase64In):
 @router.post("/auth")
 def auth(payload: AuthIn):
     try:
-        tokens, pem_material = get_tokens_from_pfx_base64(
+        tokens, pem_material = get_tokens_from_cert_base64(
             consumer_key=payload.consumer_key,
             consumer_secret=payload.consumer_secret,
             pfx_base64=payload.pfx_base64,
             pfx_password=payload.pfx_password,
+            pem_base64=payload.pem_base64,
+            key_base64=payload.key_base64,
             role_type=payload.role_type,
         )
 
@@ -359,11 +456,13 @@ def auth(payload: AuthIn):
 @router.post("/parcelamentos/consultar")
 def consultar_parcelamentos(payload: ConsultarParcelamentoIn):
     try:
-        tokens, pem_material = get_tokens_from_pfx_base64(
+        tokens, pem_material = get_tokens_from_cert_base64(
             consumer_key=payload.consumer_key,
             consumer_secret=payload.consumer_secret,
             pfx_base64=payload.pfx_base64,
             pfx_password=payload.pfx_password,
+            pem_base64=payload.pem_base64,
+            key_base64=payload.key_base64,
             role_type=payload.role_type,
         )
 
@@ -390,11 +489,13 @@ def consultar_parcelamentos(payload: ConsultarParcelamentoIn):
 @router.post("/parcelamentos/emitir")
 def emitir_parcelamento(payload: EmitirDasIn):
     try:
-        tokens, pem_material = get_tokens_from_pfx_base64(
+        tokens, pem_material = get_tokens_from_cert_base64(
             consumer_key=payload.consumer_key,
             consumer_secret=payload.consumer_secret,
             pfx_base64=payload.pfx_base64,
             pfx_password=payload.pfx_password,
+            pem_base64=payload.pem_base64,
+            key_base64=payload.key_base64,
             role_type=payload.role_type,
         )
 
