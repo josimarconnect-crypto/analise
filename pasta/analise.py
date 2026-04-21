@@ -883,7 +883,3 @@ if __name__ == "__main__":
         port=int(os.getenv("PORT", "10000")),
         reload=False,
     )
-'''
-path = Path('/mnt/data/analise_corrigido_prefixo_danfe.py')
-path.write_text(content, encoding='utf-8')
-print(path)
