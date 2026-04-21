@@ -1,4 +1,6 @@
-# -*- coding: utf-8 -*-
+from pathlib import Path
+
+content = r'''# -*- coding: utf-8 -*-
 """
 analise.py — FastAPI (Render)
 
@@ -14,6 +16,10 @@ analise.py — FastAPI (Render)
   POST /integra-parcelamento/auth
   POST /integra-parcelamento/parcelamentos/consultar
   POST /integra-parcelamento/parcelamentos/emitir
+
+✅ Rotas do danfe.py montadas com prefixo:
+  GET  /danfe/health
+  POST /danfe/danfse/pdf
 
 🔧 /extrato-produto:
   ✅ Lê TODAS as chaves de NF-e na listagem do extrato (conta corrente)
@@ -49,7 +55,7 @@ import uvicorn
 # ✅ IMPORT DO MÓDULO SECUNDÁRIO
 from parcelamento import router as parcelamento_router
 
-# ✅ IMPORT DO DANFE (FLASK)
+# ✅ IMPORT DO DANFE (FLASK) — montado com prefixo /danfe
 from danfe import app as danfe_app
 from starlette.middleware.wsgi import WSGIMiddleware
 
@@ -577,8 +583,9 @@ app = FastAPI(title="analise — Extrato (NFe + CTe separados) + Itens (BC ICMS 
 # ✅ INCLUI AS ROTAS DO parcelamento.py
 app.include_router(parcelamento_router)
 
-# ✅ INCLUI AS ROTAS DO danfe.py (Flask), preservando a lógica no próprio arquivo danfe.py
-app.mount("", WSGIMiddleware(danfe_app))
+# ✅ INCLUI AS ROTAS DO danfe.py (Flask) COM PREFIXO /danfe
+# Isso preserva /empresas, /debitos e /extrato-produto para o HTML
+app.mount("/danfe", WSGIMiddleware(danfe_app))
 
 app.add_middleware(
     CORSMiddleware,
@@ -625,7 +632,8 @@ def root():
             "/empresas",
             "/debitos",
             "/extrato-produto",
-            "/danfse/pdf",
+            "/danfe/health",
+            "/danfe/danfse/pdf",
             "/integra-parcelamento/health",
             "/integra-parcelamento/certificado/converter",
             "/integra-parcelamento/auth",
@@ -875,3 +883,7 @@ if __name__ == "__main__":
         port=int(os.getenv("PORT", "10000")),
         reload=False,
     )
+'''
+path = Path('/mnt/data/analise_corrigido_prefixo_danfe.py')
+path.write_text(content, encoding='utf-8')
+print(path)
