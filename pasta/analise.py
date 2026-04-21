@@ -877,9 +877,4 @@ def extrato_produto(
 
 # ══════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    uvicorn.run(
-        "analise:app",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "10000")),
-        reload=False,
-    )
+    uvicorn.run("analise:app", host="0.0.0.0", port=10000)
