@@ -49,6 +49,10 @@ import uvicorn
 # ✅ IMPORT DO MÓDULO SECUNDÁRIO
 from parcelamento import router as parcelamento_router
 
+# ✅ IMPORT DO DANFE (FLASK)
+from danfe import app as danfe_app
+from starlette.middleware.wsgi import WSGIMiddleware
+
 
 # ══════════════════════════════════════════════════════════════════
 # CONFIG
@@ -573,6 +577,9 @@ app = FastAPI(title="analise — Extrato (NFe + CTe separados) + Itens (BC ICMS 
 # ✅ INCLUI AS ROTAS DO parcelamento.py
 app.include_router(parcelamento_router)
 
+# ✅ INCLUI AS ROTAS DO danfe.py (Flask), preservando a lógica no próprio arquivo danfe.py
+app.mount("", WSGIMiddleware(danfe_app))
+
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=".*",
@@ -618,6 +625,7 @@ def root():
             "/empresas",
             "/debitos",
             "/extrato-produto",
+            "/danfse/pdf",
             "/integra-parcelamento/health",
             "/integra-parcelamento/certificado/converter",
             "/integra-parcelamento/auth",
