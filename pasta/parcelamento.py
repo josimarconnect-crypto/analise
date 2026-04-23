@@ -26,6 +26,7 @@ TOKEN_URL = os.getenv("SERPRO_TOKEN_URL", "https://autenticacao.sapi.serpro.gov.
 API_BASE = os.getenv("SERPRO_API_BASE", "https://gateway.apiserpro.serpro.gov.br/integra-contador/v1")
 TIMEOUT = int(os.getenv("SERPRO_TIMEOUT", "120"))
 VERIFY_SSL = os.getenv("SERPRO_VERIFY_SSL", "true").lower() != "false"
+
 URL_PARCELAMENTO_CONSULTAR = API_BASE.rstrip("/") + "/Consultar"
 URL_PARCELAMENTO_EMITIR = API_BASE.rstrip("/") + "/Emitir"
 URL_SITFIS_APOIAR = API_BASE.rstrip("/") + "/Apoiar"
@@ -36,6 +37,7 @@ ID_SERVICO_APOIAR = "SOLICITARPROTOCOLO91"
 ID_SERVICO_EMITIR = "RELATORIOSITFIS92"
 VERSAO_APOIAR = os.getenv("SERPRO_VERSAO_APOIAR", "2.0")
 VERSAO_EMITIR = os.getenv("SERPRO_VERSAO_EMITIR", "2.0")
+
 PARCELAMENTO_ID_SISTEMA = os.getenv("PARCELAMENTO_ID_SISTEMA", "PARCSN")
 PARCELAMENTO_ID_SERVICO_CONSULTAR = os.getenv("PARCELAMENTO_ID_SERVICO_CONSULTAR", "PEDIDOSPARC163")
 PARCELAMENTO_ID_SERVICO_EMITIR = os.getenv("PARCELAMENTO_ID_SERVICO_EMITIR", "GERARDAS161")
@@ -217,25 +219,7 @@ def extrair_pdf_e_espera(payload: Dict[str, Any]) -> Tuple[Optional[str], Option
         return pdf_b64, None
 
 
-def extract_pdf_text(pdf_b64: str) -> str:
-    pdf_bytes = base64.b64decode(re.sub(r"\s+", "", str(pdf_b64 or "")))
-    if pdfplumber:
-        import io
-
-        parts = []
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
-                parts.append(page.extract_text() or "")
-        return "\n".join(parts)
-    if PdfReader:
-        import io
-
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
-    raise RuntimeError("Instale pdfplumber ou pypdf para extrair o texto do PDF.")
-
-
-def normalize_text(text: str) -> str:
+def normalize_spaces(text: str) -> str:
     text = text.replace("\u00a0", " ")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\r", "\n", text)
@@ -244,45 +228,153 @@ def normalize_text(text: str) -> str:
 
 def money_to_float(value: str) -> Optional[float]:
     try:
-        return float(value.replace(".", "").replace(",", "."))
+        return float(str(value).replace(".", "").replace(",", "."))
     except Exception:
         return None
 
 
-def parse_sitfis_simplificado(pdf_b64: str) -> Dict[str, List[Dict[str, Any]]]:
-    text = normalize_text(extract_pdf_text(pdf_b64))
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+def extract_pdf_text(pdf_b64: str) -> str:
+    pdf_bytes = base64.b64decode(re.sub(r"\s+", "", str(pdf_b64 or "")))
+    if pdfplumber:
+        import io
+        parts = []
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                parts.append(page.extract_text() or "")
+        return "\n".join(parts)
+    if PdfReader:
+        import io
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
+    raise RuntimeError("Instale pdfplumber ou pypdf para extrair o texto do PDF.")
+
+
+def parse_omissoes_section(text: str) -> List[Dict[str, Any]]:
+    lines = [line.strip() for line in normalize_spaces(text).splitlines() if line.strip()]
+    omissoes: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("Omissão de "):
+            tipo = re.sub(r"_+", "", line).strip()
+            detalhe = lines[i + 1] if i + 1 < len(lines) else ""
+            ref_match = re.match(r"\(([^)]+)\)\s*(.*)", detalhe)
+            referencia_tipo = ref_match.group(1).strip() if ref_match else ""
+            periodos_texto = ref_match.group(2).strip() if ref_match else detalhe.strip()
+            periodos = [p for p in re.split(r"[ ,]+", periodos_texto) if p]
+            omissoes.append({
+                "tipo": tipo,
+                "referencia_tipo": referencia_tipo,
+                "periodos_texto": periodos_texto,
+                "periodos": periodos,
+            })
+            i += 2
+            continue
+        i += 1
+    return omissoes
+
+
+def parse_debitos_section(text: str) -> List[Dict[str, Any]]:
+    text = normalize_spaces(text)
+    start = text.find("Pendência - Débito (SIEF)")
+    if start < 0:
+        return []
+
+    end = text.find("Diagnóstico Fiscal na Procuradoria-Geral da Fazenda Nacional", start)
+    block = text[start:end] if end > start else text[start:]
+
+    lines = [line.strip() for line in block.splitlines() if line.strip()]
     debitos: List[Dict[str, Any]] = []
-    ausencia: List[Dict[str, Any]] = []
+    ultimo: Optional[Dict[str, Any]] = None
+
+    pattern = re.compile(
+        r"^(?P<receita>.+?)\s+"
+        r"(?P<pa>(?:\d{2}/\d{4}|\d{2}/\d{2}/\d{4}))\s+"
+        r"(?P<venc>\d{2}/\d{2}/\d{4})\s+"
+        r"(?P<vl_original>\d{1,3}(?:\.\d{3})*,\d{2})\s+"
+        r"(?P<sdo_devedor>\d{1,3}(?:\.\d{3})*,\d{2})\s+"
+        r"(?P<multa>\d{1,3}(?:\.\d{3})*,\d{2})\s+"
+        r"(?P<juros>\d{1,3}(?:\.\d{3})*,\d{2})\s+"
+        r"(?P<sdo_cons>\d{1,3}(?:\.\d{3})*,\d{2})\s*"
+        r"(?P<situacao>[A-ZÇÃÕÁÉÍÓÚ\- ]+)$"
+    )
 
     for line in lines:
-        low = line.lower()
-        is_debito = any(k in low for k in ("débito", "debito", "débitos", "debitos"))
-        is_ausencia = "ausência" in low or "ausencia" in low or "omiss" in low
-
-        if not is_debito and not is_ausencia:
+        if "Receita PA/Exerc." in line or line.startswith("Pendência - Débito") or line.startswith("CNPJ:"):
             continue
 
-        valor_match = re.search(r"(\d{1,3}(?:\.\d{3})*,\d{2})", line)
-        periodo_match = re.search(
-            r"(?:per[ií]odo|pa|refer[eê]ncia|compet[eê]ncia)[:\s]+([0-9/\-]+)",
-            line,
-            re.IGNORECASE,
-        )
-        item = {
-            "descricao": line,
-            "periodo": periodo_match.group(1) if periodo_match else None,
-        }
+        notif = re.search(r"Notificação de lançamento:\s*([0-9]+)", line, re.I)
+        if notif and ultimo is not None:
+            ultimo["notificacao_lancamento"] = notif.group(1)
+            continue
 
-        if is_debito:
-            item["valor"] = money_to_float(valor_match.group(1)) if valor_match else None
-            debitos.append(item)
-        if is_ausencia:
-            ausencia.append(item)
+        m = pattern.match(line)
+        if not m:
+            continue
+
+        item = {
+            "tipo": "Pendência - Débito (SIEF)",
+            "receita": m.group("receita").strip(),
+            "periodo_apuracao": m.group("pa").strip(),
+            "data_vencimento": m.group("venc").strip(),
+            "valor_original": money_to_float(m.group("vl_original")),
+            "saldo_devedor": money_to_float(m.group("sdo_devedor")),
+            "multa": money_to_float(m.group("multa")),
+            "juros": money_to_float(m.group("juros")),
+            "saldo_devedor_consolidado": money_to_float(m.group("sdo_cons")),
+            "situacao": m.group("situacao").strip(),
+        }
+        debitos.append(item)
+        ultimo = item
+
+    return debitos
+
+
+def parse_processos_section(text: str) -> List[Dict[str, Any]]:
+    text = normalize_spaces(text)
+    start = text.find("Pendência - Processo Fiscal (SIEF)")
+    if start < 0:
+        return []
+
+    lines = [line.strip() for line in text[start:].splitlines() if line.strip()]
+    processos: List[Dict[str, Any]] = []
+
+    proc_pattern = re.compile(
+        r"^(?P<processo>\d{5,}\.\d{3}\.\d{3}/\d{4}-\d{2})\s+"
+        r"(?P<situacao>[A-ZÇÃÕÁÉÍÓÚ\- ]+?)\s+"
+        r"(?P<localizacao>.+)$"
+    )
+
+    for line in lines:
+        if line.startswith("Pendência - Processo Fiscal") or line.startswith("CNPJ:") or line.startswith("Processo Situação"):
+            continue
+        m = proc_pattern.match(line)
+        if not m:
+            continue
+        processos.append({
+            "tipo": "Pendência - Processo Fiscal (SIEF)",
+            "processo": m.group("processo").strip(),
+            "situacao": m.group("situacao").strip(),
+            "localizacao": m.group("localizacao").strip(),
+        })
+
+    return processos
+
+
+def parse_sitfis_estruturado(pdf_b64: str) -> Dict[str, Any]:
+    text = extract_pdf_text(pdf_b64)
+    text = normalize_spaces(text)
+
+    cnpj_match = re.search(r"CNPJ:\s*([0-9./-]{14,18})\s*-\s*(.+)", text)
+    cnpj = cnpj_match.group(1).strip() if cnpj_match else ""
+    empresa = cnpj_match.group(2).splitlines()[0].strip() if cnpj_match else ""
 
     return {
-        "debitos": debitos,
-        "ausencia_declaracao": ausencia,
+        "cnpj": cnpj,
+        "empresa": empresa,
+        "omissoes": parse_omissoes_section(text),
+        "debitos": parse_debitos_section(text),
+        "processos": parse_processos_section(text),
     }
 
 
@@ -390,11 +482,25 @@ def consultar_um_cnpj(
         cert,
     )
     if status >= 400:
-        return {"cnpj": cnpj_contribuinte, "ok": False, "debitos": [], "ausencia_declaracao": [], "erro": "Falha ao solicitar protocolo."}
+        return {
+            "cnpj": cnpj_contribuinte,
+            "ok": False,
+            "omissoes": [],
+            "debitos": [],
+            "processos": [],
+            "erro": "Falha ao solicitar protocolo.",
+        }
 
     protocolo = extrair_protocolo(apoiar)
     if not protocolo:
-        return {"cnpj": cnpj_contribuinte, "ok": False, "debitos": [], "ausencia_declaracao": [], "erro": "Protocolo não localizado."}
+        return {
+            "cnpj": cnpj_contribuinte,
+            "ok": False,
+            "omissoes": [],
+            "debitos": [],
+            "processos": [],
+            "erro": "Protocolo não localizado.",
+        }
 
     emitir = None
     pdf_b64 = None
@@ -415,14 +521,23 @@ def consultar_um_cnpj(
         break
 
     if not pdf_b64:
-        return {"cnpj": cnpj_contribuinte, "ok": False, "debitos": [], "ausencia_declaracao": [], "erro": "Relatório sem PDF."}
+        return {
+            "cnpj": cnpj_contribuinte,
+            "ok": False,
+            "omissoes": [],
+            "debitos": [],
+            "processos": [],
+            "erro": "Relatório sem PDF.",
+        }
 
-    simplificado = parse_sitfis_simplificado(pdf_b64)
+    estruturado = parse_sitfis_estruturado(pdf_b64)
     return {
-        "cnpj": cnpj_contribuinte,
+        "cnpj": digits(estruturado.get("cnpj") or cnpj_contribuinte),
         "ok": True,
-        "debitos": simplificado["debitos"],
-        "ausencia_declaracao": simplificado["ausencia_declaracao"],
+        "empresa": estruturado.get("empresa") or "",
+        "omissoes": estruturado.get("omissoes") or [],
+        "debitos": estruturado.get("debitos") or [],
+        "processos": estruturado.get("processos") or [],
     }
 
 
@@ -533,16 +648,9 @@ def consultar_situacao():
         return jsonify({"ok": False, "erro": "Informe uma lista de CNPJs."}), 400
 
     try:
-        pem_bytes = decode_cert(payload.get("pem_base64") or payload.get("pem"))
-        key_bytes = decode_cert(payload.get("key_base64") or payload.get("key"))
+        pem_path, key_path = load_cert_paths(payload)
     except Exception as exc:
         return jsonify({"ok": False, "user": user, "erro": f"Certificado inválido: {exc}"}), 400
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pem") as pem_file, tempfile.NamedTemporaryFile(delete=False, suffix=".key") as key_file:
-        pem_file.write(pem_bytes)
-        key_file.write(key_bytes)
-        pem_path = pem_file.name
-        key_path = key_file.name
 
     try:
         session = requests.Session()
