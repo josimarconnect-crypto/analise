@@ -46,8 +46,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
 
-# ✅ IMPORT DO MÓDULO SECUNDÁRIO
-from parcelamento import router as parcelamento_router
+# ✅ IMPORT DO MÓDULO SECUNDÁRIO (FLASK)
+from parcelamento import app as parcelamento_app
 
 # ✅ IMPORT DO DANFE (FLASK)
 from danfe import app as danfe_app
@@ -461,15 +461,6 @@ def _limpar_header(h: str) -> str:
 
 
 def _force_bc_icms_from_col22(row: Dict[str, Any], headers_cut: List[str], cols_cut: List[str]) -> None:
-    """
-    ✅ Regra fixa:
-    "Valor Base Calc. ICMS" = SEMPRE o valor da COLUNA 22 (BC-01)
-
-    Preferência:
-      1) Se existir header "Valor Sub Total (BC-01)" -> usa esse valor
-      2) Senão -> usa o índice 21 (coluna 22 no humano; 0-based = 21)
-    E também atualiza cols_raw na posição do header "Valor Base Calc. ICMS".
-    """
     key_target = "Valor Base Calc. ICMS"
     key_source = "Valor Sub Total (BC-01)"
 
@@ -574,10 +565,10 @@ def parse_internamento(html_intern: str) -> Dict[str, Any]:
 # ══════════════════════════════════════════════════════════════════
 app = FastAPI(title="analise — Extrato (NFe + CTe separados) + Itens (BC ICMS = col 22)")
 
-# ✅ INCLUI AS ROTAS DO parcelamento.py
-app.include_router(parcelamento_router)
+# ✅ MONTA O FLASK DO parcelamento.py
+app.mount("", WSGIMiddleware(parcelamento_app))
 
-# ✅ INCLUI AS ROTAS DO danfe.py (Flask), preservando a lógica no próprio arquivo danfe.py
+# ✅ MONTA O FLASK DO danfe.py
 app.mount("/danfe", WSGIMiddleware(danfe_app))
 
 app.add_middleware(
@@ -628,10 +619,10 @@ def root():
             "/danfe/health",
             "/danfe/danfse/pdf",
             "/integra-parcelamento/health",
-            "/integra-parcelamento/certificado/converter",
-            "/integra-parcelamento/auth",
             "/integra-parcelamento/parcelamentos/consultar",
             "/integra-parcelamento/parcelamentos/emitir",
+            "/integra-parcelamento/parcelamentos/consultar-com-sitfis",
+            "/integra-parcelamento/situacao/consultar",
         ],
     }
 
@@ -868,7 +859,6 @@ def extrato_produto(
                 pass
 
 
-# ══════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     uvicorn.run(
         "analise:app",
