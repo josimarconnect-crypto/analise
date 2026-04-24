@@ -51,6 +51,13 @@ def digits(value: Any) -> str:
     return re.sub(r"\D+", "", str(value or ""))
 
 
+def infer_document_type(value: Any) -> int:
+    doc = digits(value)
+    if len(doc) == 11:
+        return 1
+    return 2
+
+
 def decode_cert(value: str) -> bytes:
     text = str(value or "").strip()
     if not text:
@@ -142,7 +149,7 @@ def body_parcelamento_consultar(cnpj_contador: str, cnpj_contribuinte: str) -> D
     return {
         "contratante": {"numero": cnpj_contador, "tipo": 2},
         "autorPedidoDados": {"numero": cnpj_contador, "tipo": 2},
-        "contribuinte": {"numero": cnpj_contribuinte, "tipo": 2},
+        "contribuinte": {"numero": cnpj_contribuinte, "tipo": infer_document_type(cnpj_contribuinte)},
         "pedidoDados": {
             "idSistema": PARCELAMENTO_ID_SISTEMA,
             "idServico": PARCELAMENTO_ID_SERVICO_CONSULTAR,
@@ -156,7 +163,7 @@ def body_parcelamento_emitir(cnpj_contador: str, cnpj_contribuinte: str, parcela
     return {
         "contratante": {"numero": cnpj_contador, "tipo": 2},
         "autorPedidoDados": {"numero": cnpj_contador, "tipo": 2},
-        "contribuinte": {"numero": cnpj_contribuinte, "tipo": 2},
+        "contribuinte": {"numero": cnpj_contribuinte, "tipo": infer_document_type(cnpj_contribuinte)},
         "pedidoDados": {
             "idSistema": PARCELAMENTO_ID_SISTEMA,
             "idServico": PARCELAMENTO_ID_SERVICO_EMITIR,
@@ -170,7 +177,7 @@ def body_apoiar(cnpj_contador: str, cnpj_contribuinte: str) -> Dict[str, Any]:
     return {
         "contratante": {"numero": cnpj_contador, "tipo": 2},
         "autorPedidoDados": {"numero": cnpj_contador, "tipo": 2},
-        "contribuinte": {"numero": cnpj_contribuinte, "tipo": 2},
+        "contribuinte": {"numero": cnpj_contribuinte, "tipo": infer_document_type(cnpj_contribuinte)},
         "pedidoDados": {
             "idSistema": ID_SISTEMA,
             "idServico": ID_SERVICO_APOIAR,
@@ -184,7 +191,7 @@ def body_emitir(cnpj_contador: str, cnpj_contribuinte: str, protocolo: str) -> D
     return {
         "contratante": {"numero": cnpj_contador, "tipo": 2},
         "autorPedidoDados": {"numero": cnpj_contador, "tipo": 2},
-        "contribuinte": {"numero": cnpj_contribuinte, "tipo": 2},
+        "contribuinte": {"numero": cnpj_contribuinte, "tipo": infer_document_type(cnpj_contribuinte)},
         "pedidoDados": {
             "idSistema": ID_SISTEMA,
             "idServico": ID_SERVICO_EMITIR,
@@ -636,7 +643,7 @@ def consultar_situacao():
     if isinstance(cnpjs, str):
         cnpjs = [x for x in re.split(r"[\s,;]+", cnpjs) if x]
     cnpjs = [digits(cnpj) for cnpj in cnpjs]
-    cnpjs = [cnpj for cnpj in dict.fromkeys(cnpjs) if len(cnpj) == 14]
+    cnpjs = [cnpj for cnpj in dict.fromkeys(cnpjs) if len(cnpj) in (11, 14)]
 
     if not user:
         return jsonify({"ok": False, "erro": "Informe o user."}), 400
@@ -645,7 +652,7 @@ def consultar_situacao():
     if not consumer_key or not consumer_secret:
         return jsonify({"ok": False, "erro": "Informe consumer_key e consumer_secret."}), 400
     if not cnpjs:
-        return jsonify({"ok": False, "erro": "Informe uma lista de CNPJs."}), 400
+        return jsonify({"ok": False, "erro": "Informe uma lista de CPFs/CNPJs."}), 400
 
     try:
         pem_path, key_path = load_cert_paths(payload)
@@ -693,8 +700,8 @@ def consultar_parcelamento_route():
 
     if len(cnpj_contador) != 14:
         return jsonify({"ok": False, "erro": "Informe o CNPJ do contador com 14 digitos."}), 400
-    if len(contribuinte_cnpj) != 14:
-        return jsonify({"ok": False, "erro": "Informe o CNPJ do contribuinte com 14 digitos."}), 400
+    if len(contribuinte_cnpj) not in (11, 14):
+        return jsonify({"ok": False, "erro": "Informe o CPF/CNPJ do contribuinte com 11 ou 14 digitos."}), 400
     if not consumer_key or not consumer_secret:
         return jsonify({"ok": False, "erro": "Informe consumer_key e consumer_secret."}), 400
 
@@ -740,8 +747,8 @@ def emitir_parcelamento_route():
 
     if len(cnpj_contador) != 14:
         return jsonify({"ok": False, "erro": "Informe o CNPJ do contador com 14 digitos."}), 400
-    if len(contribuinte_cnpj) != 14:
-        return jsonify({"ok": False, "erro": "Informe o CNPJ do contribuinte com 14 digitos."}), 400
+    if len(contribuinte_cnpj) not in (11, 14):
+        return jsonify({"ok": False, "erro": "Informe o CPF/CNPJ do contribuinte com 11 ou 14 digitos."}), 400
     if not consumer_key or not consumer_secret:
         return jsonify({"ok": False, "erro": "Informe consumer_key e consumer_secret."}), 400
     if not re.fullmatch(r"\d{6}", parcela_aaaamm):
@@ -793,8 +800,8 @@ def consultar_parcelamento_com_sitfis_route():
         return jsonify({"ok": False, "erro": "Informe o user."}), 400
     if len(cnpj_contador) != 14:
         return jsonify({"ok": False, "erro": "Informe o CNPJ do contador com 14 digitos."}), 400
-    if len(contribuinte_cnpj) != 14:
-        return jsonify({"ok": False, "erro": "Informe o CNPJ do contribuinte com 14 digitos."}), 400
+    if len(contribuinte_cnpj) not in (11, 14):
+        return jsonify({"ok": False, "erro": "Informe o CPF/CNPJ do contribuinte com 11 ou 14 digitos."}), 400
     if not consumer_key or not consumer_secret:
         return jsonify({"ok": False, "erro": "Informe consumer_key e consumer_secret."}), 400
 
