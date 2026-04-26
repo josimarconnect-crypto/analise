@@ -43,6 +43,12 @@ PARCELAMENTO_ID_SERVICO_CONSULTAR = os.getenv("PARCELAMENTO_ID_SERVICO_CONSULTAR
 PARCELAMENTO_ID_SERVICO_EMITIR = os.getenv("PARCELAMENTO_ID_SERVICO_EMITIR", "GERARDAS161")
 PARCELAMENTO_VERSAO = os.getenv("PARCELAMENTO_VERSAO", "1.0")
 
+CAIXAPOSTAL_ID_SISTEMA = os.getenv("CAIXAPOSTAL_ID_SISTEMA", "CAIXAPOSTAL")
+CAIXAPOSTAL_ID_SERVICO_LISTA = os.getenv("CAIXAPOSTAL_ID_SERVICO_LISTA", "MSGCONTRIBUINTE61")
+CAIXAPOSTAL_ID_SERVICO_DETALHE = os.getenv("CAIXAPOSTAL_ID_SERVICO_DETALHE", "MSGDETALHAMENTO62")
+CAIXAPOSTAL_ID_SERVICO_INDICADOR = os.getenv("CAIXAPOSTAL_ID_SERVICO_INDICADOR", "INNOVAMSG63")
+CAIXAPOSTAL_VERSAO = os.getenv("CAIXAPOSTAL_VERSAO", "1.0")
+
 app = Flask(__name__)
 CORS(app)
 
@@ -169,6 +175,67 @@ def body_parcelamento_emitir(cnpj_contador: str, cnpj_contribuinte: str, parcela
             "idServico": PARCELAMENTO_ID_SERVICO_EMITIR,
             "versaoSistema": PARCELAMENTO_VERSAO,
             "dados": json.dumps({"parcelaParaEmitir": int(parcela_aaaamm)}, ensure_ascii=False),
+        },
+    }
+
+
+def body_caixa_postal_lista(
+    cnpj_contador: str,
+    cnpj_contribuinte: str,
+    status_leitura: int,
+    indicador_pagina: int,
+    indicador_favorito: Optional[int] = None,
+    ponteiro_pagina: str = "",
+    cnpj_referencia: str = "",
+) -> Dict[str, Any]:
+    dados: Dict[str, Any] = {
+        "statusLeitura": int(status_leitura),
+        "indicadorPagina": int(indicador_pagina),
+    }
+    if indicador_favorito is not None:
+        dados["indicadorFavorito"] = int(indicador_favorito)
+    if ponteiro_pagina:
+        dados["ponteiroPagina"] = digits(ponteiro_pagina)
+    if cnpj_referencia:
+        dados["cnpjReferencia"] = digits(cnpj_referencia)
+
+    return {
+        "contratante": {"numero": cnpj_contador, "tipo": 2},
+        "autorPedidoDados": {"numero": cnpj_contador, "tipo": 2},
+        "contribuinte": {"numero": cnpj_contribuinte, "tipo": infer_document_type(cnpj_contribuinte)},
+        "pedidoDados": {
+            "idSistema": CAIXAPOSTAL_ID_SISTEMA,
+            "idServico": CAIXAPOSTAL_ID_SERVICO_LISTA,
+            "versaoSistema": CAIXAPOSTAL_VERSAO,
+            "dados": json.dumps(dados, ensure_ascii=False),
+        },
+    }
+
+
+def body_caixa_postal_detalhe(cnpj_contador: str, cnpj_contribuinte: str, isn: str) -> Dict[str, Any]:
+    return {
+        "contratante": {"numero": cnpj_contador, "tipo": 2},
+        "autorPedidoDados": {"numero": cnpj_contador, "tipo": 2},
+        "contribuinte": {"numero": cnpj_contribuinte, "tipo": infer_document_type(cnpj_contribuinte)},
+        "pedidoDados": {
+            "idSistema": CAIXAPOSTAL_ID_SISTEMA,
+            "idServico": CAIXAPOSTAL_ID_SERVICO_DETALHE,
+            "versaoSistema": CAIXAPOSTAL_VERSAO,
+            "dados": json.dumps({"isn": digits(isn)}, ensure_ascii=False),
+        },
+    }
+
+
+def body_caixa_postal_indicador(cnpj_contador: str, cnpj_contribuinte: str) -> Dict[str, Any]:
+    return {
+        "contratante": {"numero": cnpj_contador, "tipo": 2},
+        "autorPedidoDados": {"numero": cnpj_contador, "tipo": 2},
+        "contribuinte": {"numero": cnpj_contribuinte, "tipo": infer_document_type(cnpj_contribuinte)},
+        "pedidoDados": {
+            "idSistema": CAIXAPOSTAL_ID_SISTEMA,
+            "idServico": CAIXAPOSTAL_ID_SERVICO_INDICADOR,
+            "versaoSistema": CAIXAPOSTAL_VERSAO,
+            "dados": "",
         },
     }
 
@@ -471,6 +538,108 @@ def summarize_parcelamento_payload(payload: Dict[str, Any], contribuinte_cnpj: s
     }
 
 
+def normalize_assunto_modelo(mensagem: Dict[str, Any]) -> str:
+    assunto = str(first_not_empty(mensagem, "assuntoModelo", "assunto", "assunto_modelo") or "")
+    variavel = first_not_empty(mensagem, "valorParametroAssunto", "valor_parametro_assunto")
+    if assunto and variavel not in (None, "") and "++VARIAVEL++" in assunto:
+        return assunto.replace("++VARIAVEL++", str(variavel))
+    return assunto
+
+
+def extract_object_list(node: Any) -> List[Dict[str, Any]]:
+    if isinstance(node, list):
+        return [item for item in node if isinstance(item, dict)]
+    return []
+
+
+def normalize_caixa_postal_mensagem(mensagem: Dict[str, Any]) -> Dict[str, Any]:
+    indicador_leitura = str(first_not_empty(mensagem, "indicadorLeitura", "indLeitura") or "")
+    indicador_favorito = str(first_not_empty(mensagem, "indicadorFavorito", "indFavorito") or "")
+    return {
+        "isn": str(first_not_empty(mensagem, "isn", "ISN") or ""),
+        "assunto": normalize_assunto_modelo(mensagem),
+        "assunto_modelo": str(first_not_empty(mensagem, "assuntoModelo", "assunto") or ""),
+        "valor_parametro_assunto": str(first_not_empty(mensagem, "valorParametroAssunto", "valor_parametro_assunto") or ""),
+        "data_envio": str(first_not_empty(mensagem, "dataEnvio", "data_envio") or ""),
+        "hora_envio": str(first_not_empty(mensagem, "horaEnvio", "hora_envio") or ""),
+        "origem": str(first_not_empty(mensagem, "descricaoOrigem", "origem", "nomeOrigem") or ""),
+        "tipo_origem": str(first_not_empty(mensagem, "tipoOrigem", "tipo_origem") or ""),
+        "relevancia": str(first_not_empty(mensagem, "relevancia") or ""),
+        "indicador_leitura": indicador_leitura,
+        "indicador_favorito": indicador_favorito,
+        "lida": indicador_leitura == "1",
+        "favorita": indicador_favorito == "1",
+        "raw": mensagem,
+    }
+
+
+def summarize_caixa_postal_lista_payload(payload: Dict[str, Any], contribuinte_cnpj: str) -> Dict[str, Any]:
+    dados = payload.get("dados_parseados")
+    parsed: Dict[str, Any] = dados if isinstance(dados, dict) else {}
+
+    mensagens = extract_object_list(parsed.get("listaMensagens"))
+    if not mensagens:
+        for key in ("mensagens", "conteudo", "lista", "itens"):
+            mensagens = extract_object_list(parsed.get(key))
+            if mensagens:
+                break
+
+    quantidade = first_not_empty(parsed, "quantidadeMensagens", "quantidade", "totalMensagens")
+    if quantidade in (None, ""):
+        quantidade = len(mensagens)
+
+    return {
+        "cnpj": contribuinte_cnpj,
+        "codigo": first_not_empty(parsed, "codigo", "status", "_http_status"),
+        "mensagem": first_not_empty(payload, "mensagem", "message", "msg"),
+        "indicador_ultima_pagina": first_not_empty(parsed, "indicadorUltimaPagina", "ultimaPagina"),
+        "ponteiro_pagina_retornada": first_not_empty(parsed, "ponteiroPaginaRetornada", "ponteiroPagina"),
+        "ponteiro_proxima_pagina": first_not_empty(parsed, "ponteiroProximaPagina", "proximaPagina"),
+        "quantidade_mensagens": int(quantidade) if str(quantidade).isdigit() else quantidade,
+        "total_registros": len(mensagens),
+        "mensagens": [normalize_caixa_postal_mensagem(item) for item in mensagens],
+    }
+
+
+def summarize_caixa_postal_detalhe_payload(payload: Dict[str, Any], contribuinte_cnpj: str, isn: str) -> Dict[str, Any]:
+    dados = payload.get("dados_parseados")
+    parsed: Dict[str, Any] = dados if isinstance(dados, dict) else {}
+
+    conteudo = extract_object_list(parsed.get("conteudo"))
+    if not conteudo:
+        conteudo = extract_object_list(parsed.get("mensagens"))
+    if not conteudo and parsed:
+        conteudo = [parsed]
+
+    mensagens = [normalize_caixa_postal_mensagem(item) for item in conteudo]
+    return {
+        "cnpj": contribuinte_cnpj,
+        "isn": digits(isn),
+        "codigo": first_not_empty(parsed, "codigo", "status", "_http_status"),
+        "mensagem": first_not_empty(payload, "mensagem", "message", "msg"),
+        "total_registros": len(mensagens),
+        "mensagens": mensagens,
+    }
+
+
+def summarize_caixa_postal_indicador_payload(payload: Dict[str, Any], contribuinte_cnpj: str) -> Dict[str, Any]:
+    dados = payload.get("dados_parseados")
+    parsed: Dict[str, Any] = dados if isinstance(dados, dict) else {}
+    indicador = first_not_empty(parsed, "indicadorMensagensNovas", "indicador_mensagens_novas", "indicador")
+    indicador_int: Optional[int] = None
+    try:
+        indicador_int = int(str(indicador))
+    except Exception:
+        indicador_int = None
+    return {
+        "cnpj": contribuinte_cnpj,
+        "codigo": first_not_empty(parsed, "codigo", "status", "_http_status"),
+        "mensagem": first_not_empty(payload, "mensagem", "message", "msg"),
+        "indicador_mensagens_novas": indicador_int,
+        "possui_mensagem_nova": indicador_int in (1, 2),
+    }
+
+
 def consultar_um_cnpj(
     session: requests.Session,
     cert: Tuple[str, str],
@@ -612,6 +781,96 @@ def emitir_parcelamento(
     return retorno
 
 
+def consultar_caixa_postal_lista(
+    session: requests.Session,
+    cert: Tuple[str, str],
+    access_token: str,
+    jwt_token: str,
+    cnpj_contador: str,
+    cnpj_contribuinte: str,
+    status_leitura: int,
+    indicador_pagina: int,
+    indicador_favorito: Optional[int] = None,
+    ponteiro_pagina: str = "",
+    cnpj_referencia: str = "",
+) -> Dict[str, Any]:
+    status, resposta = post_json(
+        session,
+        URL_PARCELAMENTO_CONSULTAR,
+        headers(access_token, jwt_token),
+        body_caixa_postal_lista(
+            cnpj_contador=cnpj_contador,
+            cnpj_contribuinte=cnpj_contribuinte,
+            status_leitura=status_leitura,
+            indicador_pagina=indicador_pagina,
+            indicador_favorito=indicador_favorito,
+            ponteiro_pagina=ponteiro_pagina,
+            cnpj_referencia=cnpj_referencia,
+        ),
+        cert,
+    )
+    if status >= 400:
+        raise RuntimeError(first_not_empty(resposta, "mensagem", "message", "raw") or "Falha ao consultar caixa postal.")
+    return {
+        "ok": True,
+        "servico": "caixa_postal_caixa_entrada",
+        "cnpj": cnpj_contribuinte,
+        "resumo": summarize_caixa_postal_lista_payload(resposta, cnpj_contribuinte),
+    }
+
+
+def consultar_caixa_postal_detalhe(
+    session: requests.Session,
+    cert: Tuple[str, str],
+    access_token: str,
+    jwt_token: str,
+    cnpj_contador: str,
+    cnpj_contribuinte: str,
+    isn: str,
+) -> Dict[str, Any]:
+    status, resposta = post_json(
+        session,
+        URL_PARCELAMENTO_CONSULTAR,
+        headers(access_token, jwt_token),
+        body_caixa_postal_detalhe(cnpj_contador, cnpj_contribuinte, isn),
+        cert,
+    )
+    if status >= 400:
+        raise RuntimeError(first_not_empty(resposta, "mensagem", "message", "raw") or "Falha ao consultar detalhe da mensagem.")
+    return {
+        "ok": True,
+        "servico": "caixa_postal_detalhe_mensagem",
+        "cnpj": cnpj_contribuinte,
+        "isn": digits(isn),
+        "resumo": summarize_caixa_postal_detalhe_payload(resposta, cnpj_contribuinte, isn),
+    }
+
+
+def consultar_caixa_postal_indicador(
+    session: requests.Session,
+    cert: Tuple[str, str],
+    access_token: str,
+    jwt_token: str,
+    cnpj_contador: str,
+    cnpj_contribuinte: str,
+) -> Dict[str, Any]:
+    status, resposta = post_json(
+        session,
+        URL_PARCELAMENTO_CONSULTAR,
+        headers(access_token, jwt_token),
+        body_caixa_postal_indicador(cnpj_contador, cnpj_contribuinte),
+        cert,
+    )
+    if status >= 400:
+        raise RuntimeError(first_not_empty(resposta, "mensagem", "message", "raw") or "Falha ao consultar indicador de novas mensagens.")
+    return {
+        "ok": True,
+        "servico": "caixa_postal_indicador",
+        "cnpj": cnpj_contribuinte,
+        "resumo": summarize_caixa_postal_indicador_payload(resposta, cnpj_contribuinte),
+    }
+
+
 def get_common_credentials(payload: Dict[str, Any]) -> Tuple[str, str, str]:
     consumer_key = str(payload.get("consumer_key") or "").strip()
     consumer_secret = str(payload.get("consumer_secret") or "").strip()
@@ -626,6 +885,26 @@ def load_cert_paths(payload: Dict[str, Any]) -> Tuple[str, str]:
         pem_file.write(pem_bytes)
         key_file.write(key_bytes)
         return pem_file.name, key_file.name
+
+
+def parse_int_field(
+    value: Any,
+    field_name: str,
+    allowed: Optional[List[int]] = None,
+    default: Optional[int] = None,
+) -> int:
+    if value in (None, ""):
+        if default is None:
+            raise ValueError(f"Informe {field_name}.")
+        return int(default)
+    try:
+        out = int(str(value).strip())
+    except Exception:
+        raise ValueError(f"Campo {field_name} invalido.")
+    if allowed is not None and out not in allowed:
+        allowed_text = ", ".join(str(item) for item in allowed)
+        raise ValueError(f"Campo {field_name} invalido. Valores permitidos: {allowed_text}.")
+    return out
 
 
 @app.post("/integra-sitfis/situacao/consultar")
@@ -852,6 +1131,188 @@ def consultar_parcelamento_com_sitfis_route():
                 pass
 
 
+@app.post("/integra-caixapostal/caixa-entrada/consultar")
+@app.post("/integra-caixapostal/mensagens/consultar")
+def consultar_caixa_postal_caixa_entrada_route():
+    payload = request.get_json(silent=True) or {}
+    consumer_key, consumer_secret, cnpj_contador = get_common_credentials(payload)
+    contribuinte_cnpj = digits(payload.get("contribuinte_cnpj") or payload.get("cnpj"))
+    ponteiro_pagina = digits(payload.get("ponteiro_pagina") or payload.get("ponteiroPagina"))
+    cnpj_referencia = digits(payload.get("cnpj_referencia") or payload.get("cnpjReferencia"))
+
+    try:
+        status_leitura = parse_int_field(
+            payload.get("status_leitura", payload.get("statusLeitura")),
+            "status_leitura",
+            allowed=[0, 1, 2],
+            default=0,
+        )
+        indicador_pagina = parse_int_field(
+            payload.get("indicador_pagina", payload.get("indicadorPagina")),
+            "indicador_pagina",
+            allowed=[0, 1],
+            default=0,
+        )
+        indicador_favorito_raw = payload.get("indicador_favorito", payload.get("indicadorFavorito"))
+        indicador_favorito = None
+        if indicador_favorito_raw not in (None, ""):
+            indicador_favorito = parse_int_field(
+                indicador_favorito_raw,
+                "indicador_favorito",
+                allowed=[0, 1],
+            )
+    except ValueError as exc:
+        return jsonify({"ok": False, "erro": str(exc)}), 400
+
+    if len(cnpj_contador) != 14:
+        return jsonify({"ok": False, "erro": "Informe o CNPJ do contador com 14 digitos."}), 400
+    if len(contribuinte_cnpj) not in (11, 14):
+        return jsonify({"ok": False, "erro": "Informe o CPF/CNPJ do contribuinte com 11 ou 14 digitos."}), 400
+    if not consumer_key or not consumer_secret:
+        return jsonify({"ok": False, "erro": "Informe consumer_key e consumer_secret."}), 400
+    if indicador_pagina == 1 and not ponteiro_pagina:
+        return jsonify({"ok": False, "erro": "Para indicador_pagina=1, informe ponteiro_pagina."}), 400
+    if cnpj_referencia and len(cnpj_referencia) != 14:
+        return jsonify({"ok": False, "erro": "Campo cnpj_referencia deve possuir 14 digitos."}), 400
+
+    try:
+        pem_path, key_path = load_cert_paths(payload)
+    except Exception as exc:
+        return jsonify({"ok": False, "erro": f"Certificado invalido: {exc}"}), 400
+
+    try:
+        session = requests.Session()
+        cert = (pem_path, key_path)
+        auth = authenticate(session, consumer_key, consumer_secret, cert)
+        resultado = consultar_caixa_postal_lista(
+            session=session,
+            cert=cert,
+            access_token=auth["access_token"],
+            jwt_token=auth["jwt_token"],
+            cnpj_contador=cnpj_contador,
+            cnpj_contribuinte=contribuinte_cnpj,
+            status_leitura=status_leitura,
+            indicador_pagina=indicador_pagina,
+            indicador_favorito=indicador_favorito,
+            ponteiro_pagina=ponteiro_pagina,
+            cnpj_referencia=cnpj_referencia,
+        )
+        resultado["filtros"] = {
+            "status_leitura": status_leitura,
+            "indicador_pagina": indicador_pagina,
+            "indicador_favorito": indicador_favorito,
+            "ponteiro_pagina": ponteiro_pagina,
+            "cnpj_referencia": cnpj_referencia,
+        }
+        resultado["tokens"] = {"expires_in": auth.get("expires_in")}
+        return jsonify(resultado)
+    except requests.HTTPError as exc:
+        detail = exc.response.text if exc.response is not None else str(exc)
+        return jsonify({"ok": False, "erro": detail}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "erro": str(exc)}), 500
+    finally:
+        for path in (pem_path, key_path):
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+
+@app.post("/integra-caixapostal/mensagens/detalhar")
+def consultar_caixa_postal_detalhe_route():
+    payload = request.get_json(silent=True) or {}
+    consumer_key, consumer_secret, cnpj_contador = get_common_credentials(payload)
+    contribuinte_cnpj = digits(payload.get("contribuinte_cnpj") or payload.get("cnpj"))
+    isn = digits(payload.get("isn"))
+
+    if len(cnpj_contador) != 14:
+        return jsonify({"ok": False, "erro": "Informe o CNPJ do contador com 14 digitos."}), 400
+    if len(contribuinte_cnpj) not in (11, 14):
+        return jsonify({"ok": False, "erro": "Informe o CPF/CNPJ do contribuinte com 11 ou 14 digitos."}), 400
+    if not consumer_key or not consumer_secret:
+        return jsonify({"ok": False, "erro": "Informe consumer_key e consumer_secret."}), 400
+    if not isn:
+        return jsonify({"ok": False, "erro": "Informe o ISN da mensagem."}), 400
+
+    try:
+        pem_path, key_path = load_cert_paths(payload)
+    except Exception as exc:
+        return jsonify({"ok": False, "erro": f"Certificado invalido: {exc}"}), 400
+
+    try:
+        session = requests.Session()
+        cert = (pem_path, key_path)
+        auth = authenticate(session, consumer_key, consumer_secret, cert)
+        resultado = consultar_caixa_postal_detalhe(
+            session=session,
+            cert=cert,
+            access_token=auth["access_token"],
+            jwt_token=auth["jwt_token"],
+            cnpj_contador=cnpj_contador,
+            cnpj_contribuinte=contribuinte_cnpj,
+            isn=isn,
+        )
+        resultado["tokens"] = {"expires_in": auth.get("expires_in")}
+        return jsonify(resultado)
+    except requests.HTTPError as exc:
+        detail = exc.response.text if exc.response is not None else str(exc)
+        return jsonify({"ok": False, "erro": detail}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "erro": str(exc)}), 500
+    finally:
+        for path in (pem_path, key_path):
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+
+@app.post("/integra-caixapostal/mensagens/indicador")
+def consultar_caixa_postal_indicador_route():
+    payload = request.get_json(silent=True) or {}
+    consumer_key, consumer_secret, cnpj_contador = get_common_credentials(payload)
+    contribuinte_cnpj = digits(payload.get("contribuinte_cnpj") or payload.get("cnpj"))
+
+    if len(cnpj_contador) != 14:
+        return jsonify({"ok": False, "erro": "Informe o CNPJ do contador com 14 digitos."}), 400
+    if len(contribuinte_cnpj) not in (11, 14):
+        return jsonify({"ok": False, "erro": "Informe o CPF/CNPJ do contribuinte com 11 ou 14 digitos."}), 400
+    if not consumer_key or not consumer_secret:
+        return jsonify({"ok": False, "erro": "Informe consumer_key e consumer_secret."}), 400
+
+    try:
+        pem_path, key_path = load_cert_paths(payload)
+    except Exception as exc:
+        return jsonify({"ok": False, "erro": f"Certificado invalido: {exc}"}), 400
+
+    try:
+        session = requests.Session()
+        cert = (pem_path, key_path)
+        auth = authenticate(session, consumer_key, consumer_secret, cert)
+        resultado = consultar_caixa_postal_indicador(
+            session=session,
+            cert=cert,
+            access_token=auth["access_token"],
+            jwt_token=auth["jwt_token"],
+            cnpj_contador=cnpj_contador,
+            cnpj_contribuinte=contribuinte_cnpj,
+        )
+        resultado["tokens"] = {"expires_in": auth.get("expires_in")}
+        return jsonify(resultado)
+    except requests.HTTPError as exc:
+        detail = exc.response.text if exc.response is not None else str(exc)
+        return jsonify({"ok": False, "erro": detail}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "erro": str(exc)}), 500
+    finally:
+        for path in (pem_path, key_path):
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+
 @app.get("/health")
 def health():
     return jsonify({
@@ -863,6 +1324,10 @@ def health():
             "/integra-parcelamento/parcelamentos/consultar",
             "/integra-parcelamento/parcelamentos/emitir",
             "/integra-parcelamento/parcelamentos/consultar-com-sitfis",
+            "/integra-caixapostal/caixa-entrada/consultar",
+            "/integra-caixapostal/mensagens/consultar",
+            "/integra-caixapostal/mensagens/detalhar",
+            "/integra-caixapostal/mensagens/indicador",
         ],
     })
 
