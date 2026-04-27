@@ -942,18 +942,28 @@ def consultar_situacao():
         session = requests.Session()
         cert = (pem_path, key_path)
         auth = authenticate(session, consumer_key, consumer_secret, cert)
-        resultados = [
-            consultar_um_cnpj(
-                session=session,
-                cert=cert,
-                access_token=auth["access_token"],
-                jwt_token=auth["jwt_token"],
-                cnpj_contador=cnpj_contador,
-                cnpj_contribuinte=cnpj,
-                procurador_token=procurador_token,
-            )
-            for cnpj in cnpjs
-        ]
+        resultados: List[Dict[str, Any]] = []
+        for cnpj in cnpjs:
+            try:
+                item = consultar_um_cnpj(
+                    session=session,
+                    cert=cert,
+                    access_token=auth["access_token"],
+                    jwt_token=auth["jwt_token"],
+                    cnpj_contador=cnpj_contador,
+                    cnpj_contribuinte=cnpj,
+                    procurador_token=procurador_token,
+                )
+            except Exception as item_exc:
+                item = {
+                    "cnpj": cnpj,
+                    "ok": False,
+                    "omissoes": [],
+                    "debitos": [],
+                    "processos": [],
+                    "erro": f"Falha ao processar CNPJ no lote: {item_exc}",
+                }
+            resultados.append(item)
         return jsonify({
             "ok": all(item.get("ok") for item in resultados),
             "user": user,
