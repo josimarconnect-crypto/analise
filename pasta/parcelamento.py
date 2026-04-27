@@ -4,6 +4,7 @@ import os
 import re
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -707,14 +708,49 @@ def consultar_um_cnpj(
         }
 
     estruturado = parse_sitfis_estruturado(pdf_b64)
+    cnpj_pdf = digits(estruturado.get("cnpj") or "")
     return {
-        "cnpj": digits(estruturado.get("cnpj") or cnpj_contribuinte),
+        # Mantem o CNPJ consultado como chave canônica do retorno do lote.
+        # Isso evita colapsar múltiplos resultados quando o parser do PDF
+        # extrai o mesmo documento para entradas diferentes.
+        "cnpj": cnpj_contribuinte,
+        "cnpj_pdf": cnpj_pdf,
         "ok": True,
         "empresa": estruturado.get("empresa") or "",
         "omissoes": estruturado.get("omissoes") or [],
         "debitos": estruturado.get("debitos") or [],
         "processos": estruturado.get("processos") or [],
     }
+
+
+def consultar_um_cnpj_safe(
+    cert: Tuple[str, str],
+    access_token: str,
+    jwt_token: str,
+    cnpj_contador: str,
+    cnpj_contribuinte: str,
+    procurador_token: str,
+) -> Dict[str, Any]:
+    try:
+        with requests.Session() as session:
+            return consultar_um_cnpj(
+                session=session,
+                cert=cert,
+                access_token=access_token,
+                jwt_token=jwt_token,
+                cnpj_contador=cnpj_contador,
+                cnpj_contribuinte=cnpj_contribuinte,
+                procurador_token=procurador_token,
+            )
+    except Exception as item_exc:
+        return {
+            "cnpj": cnpj_contribuinte,
+            "ok": False,
+            "omissoes": [],
+            "debitos": [],
+            "processos": [],
+            "erro": f"Falha ao processar CNPJ no lote: {item_exc}",
+        }
 
 
 def consultar_parcelamento(
@@ -918,6 +954,7 @@ def consultar_situacao():
     cnpj_contador = digits(payload.get("contratante_cnpj") or payload.get("autor_cnpj") or payload.get("cnpj_contador"))
     cnpjs = payload.get("cnpjs") or payload.get("contribuintes") or payload.get("lista_cnpj") or []
     procurador_token = str(payload.get("procurador_token") or "").strip()
+    max_workers_raw = payload.get("max_workers", os.getenv("SITFIS_MAX_WORKERS", "2"))
 
     if isinstance(cnpjs, str):
         cnpjs = [x for x in re.split(r"[\s,;]+", cnpjs) if x]
@@ -934,41 +971,81 @@ def consultar_situacao():
         return jsonify({"ok": False, "erro": "Informe uma lista de CPFs/CNPJs."}), 400
 
     try:
+        max_workers = int(str(max_workers_raw).strip())
+    except Exception:
+        max_workers = 2
+    max_workers = max(1, min(max_workers, 8))
+
+    try:
         pem_path, key_path = load_cert_paths(payload)
     except Exception as exc:
         return jsonify({"ok": False, "user": user, "erro": f"Certificado inválido: {exc}"}), 400
 
     try:
-        session = requests.Session()
-        cert = (pem_path, key_path)
-        auth = authenticate(session, consumer_key, consumer_secret, cert)
+        with requests.Session() as auth_session:
+            cert = (pem_path, key_path)
+            auth = authenticate(auth_session, consumer_key, consumer_secret, cert)
+
         resultados: List[Dict[str, Any]] = []
-        for cnpj in cnpjs:
-            try:
-                item = consultar_um_cnpj(
-                    session=session,
-                    cert=cert,
-                    access_token=auth["access_token"],
-                    jwt_token=auth["jwt_token"],
-                    cnpj_contador=cnpj_contador,
-                    cnpj_contribuinte=cnpj,
-                    procurador_token=procurador_token,
+        if max_workers <= 1 or len(cnpjs) <= 1:
+            for cnpj in cnpjs:
+                resultados.append(
+                    consultar_um_cnpj_safe(
+                        cert=cert,
+                        access_token=auth["access_token"],
+                        jwt_token=auth["jwt_token"],
+                        cnpj_contador=cnpj_contador,
+                        cnpj_contribuinte=cnpj,
+                        procurador_token=procurador_token,
+                    )
                 )
-            except Exception as item_exc:
-                item = {
-                    "cnpj": cnpj,
+        else:
+            ordered_results: List[Optional[Dict[str, Any]]] = [None] * len(cnpjs)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(
+                        consultar_um_cnpj_safe,
+                        cert,
+                        auth["access_token"],
+                        auth["jwt_token"],
+                        cnpj_contador,
+                        cnpj,
+                        procurador_token,
+                    ): idx
+                    for idx, cnpj in enumerate(cnpjs)
+                }
+                for future in as_completed(future_map):
+                    idx = future_map[future]
+                    try:
+                        ordered_results[idx] = future.result()
+                    except Exception as exc:
+                        ordered_results[idx] = {
+                            "cnpj": cnpjs[idx],
+                            "ok": False,
+                            "omissoes": [],
+                            "debitos": [],
+                            "processos": [],
+                            "erro": f"Falha ao processar CNPJ no lote: {exc}",
+                        }
+
+            resultados = [
+                item if item is not None else {
+                    "cnpj": cnpjs[idx],
                     "ok": False,
                     "omissoes": [],
                     "debitos": [],
                     "processos": [],
-                    "erro": f"Falha ao processar CNPJ no lote: {item_exc}",
+                    "erro": "Falha interna ao consolidar resultado no lote.",
                 }
-            resultados.append(item)
+                for idx, item in enumerate(ordered_results)
+            ]
+
         return jsonify({
             "ok": all(item.get("ok") for item in resultados),
             "user": user,
             "gerado_em": datetime.now().isoformat(timespec="seconds"),
             "total_cnpjs": len(resultados),
+            "max_workers": max_workers,
             "resultados": resultados,
         })
     except Exception as exc:
