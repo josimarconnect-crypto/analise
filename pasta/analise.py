@@ -22,10 +22,7 @@ from starlette.middleware.wsgi import WSGIMiddleware
 try:
     from parcelamento import app as parcelamento_app  # type: ignore
 except Exception:
-    try:
-        from sitfis_backend_api import app as parcelamento_app  # type: ignore
-    except Exception:
-        parcelamento_app = None
+    parcelamento_app = None
 
 try:
     from danfe import app as danfe_app  # type: ignore
