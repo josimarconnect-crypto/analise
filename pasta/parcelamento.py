@@ -50,6 +50,15 @@ CAIXAPOSTAL_ID_SERVICO_DETALHE = os.getenv("CAIXAPOSTAL_ID_SERVICO_DETALHE", "MS
 CAIXAPOSTAL_ID_SERVICO_INDICADOR = os.getenv("CAIXAPOSTAL_ID_SERVICO_INDICADOR", "INNOVAMSG63")
 CAIXAPOSTAL_VERSAO = os.getenv("CAIXAPOSTAL_VERSAO", "1.0")
 
+CND_TOKEN_URL = os.getenv("CND_TOKEN_URL", "https://gateway.apiserpro.serpro.gov.br/token").strip()
+CND_CERTIDAO_URL = os.getenv(
+    "CND_CERTIDAO_URL",
+    "https://gateway.apiserpro.serpro.gov.br/consulta-cnd/v1/certidao",
+).strip()
+CND_STATUS7_WAIT_MS = int(os.getenv("CND_STATUS7_WAIT_MS", "500"))
+CND_MAX_TENTATIVAS = int(os.getenv("CND_MAX_TENTATIVAS", "12"))
+CND_OUTPUT_DIR = os.getenv("CND_OUTPUT_DIR", "jsoncnd").strip() or "jsoncnd"
+
 app = Flask(__name__)
 CORS(app)
 
@@ -267,6 +276,98 @@ def body_emitir(cnpj_contador: str, cnpj_contribuinte: str, protocolo: str) -> D
             "dados": json.dumps({"protocoloRelatorio": protocolo}, ensure_ascii=False),
         },
     }
+
+
+def infer_cnd_tipo_contribuinte(documento: str) -> int:
+    doc = digits(documento)
+    if len(doc) == 14:
+        return 1
+    if len(doc) == 11:
+        return 2
+    if len(doc) == 8:
+        return 3
+    raise ValueError("Documento invalido para CND. Informe CNPJ (14), CPF (11) ou NIRF (8).")
+
+
+def infer_cnd_codigo_identificacao(tipo_contribuinte: int) -> str:
+    mapping = {1: "9001", 2: "9002", 3: "9003"}
+    if tipo_contribuinte not in mapping:
+        raise ValueError("TipoContribuinte invalido para CND.")
+    return mapping[tipo_contribuinte]
+
+
+def body_cnd_consultar(
+    documento: str,
+    gerar_certidao_pdf: bool,
+    chave: str = "",
+    tipo_contribuinte: Optional[int] = None,
+    codigo_identificacao: str = "",
+) -> Dict[str, Any]:
+    doc = digits(documento)
+    tipo = tipo_contribuinte if tipo_contribuinte in (1, 2, 3) else infer_cnd_tipo_contribuinte(doc)
+    codigo = str(codigo_identificacao or infer_cnd_codigo_identificacao(tipo)).strip()
+    body: Dict[str, Any] = {
+        "TipoContribuinte": int(tipo),
+        "ContribuinteConsulta": doc,
+        "CodigoIdentificacao": codigo,
+        "GerarCertidaoPdf": bool(gerar_certidao_pdf),
+    }
+    chave = str(chave or "").strip()
+    if chave:
+        body["Chave"] = chave
+    return body
+
+
+def post_cnd_json(
+    session: requests.Session,
+    url: str,
+    headers: Dict[str, str],
+    body: Dict[str, Any],
+) -> Tuple[int, Dict[str, Any]]:
+    resp = session.post(
+        url,
+        headers=headers,
+        json=body,
+        timeout=TIMEOUT,
+        verify=VERIFY_SSL,
+    )
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = {"raw": resp.text}
+    payload["_http_status"] = resp.status_code
+    return resp.status_code, payload
+
+
+def authenticate_cnd(session: requests.Session, consumer_key: str, consumer_secret: str, token_url: str) -> Dict[str, Any]:
+    basic = base64.b64encode(f"{consumer_key}:{consumer_secret}".encode("utf-8")).decode("utf-8")
+    resp = session.post(
+        token_url,
+        data="grant_type=client_credentials",
+        headers={
+            "Authorization": f"Basic {basic}",
+            "content-type": "application/x-www-form-urlencoded",
+        },
+        timeout=TIMEOUT,
+        verify=VERIFY_SSL,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    if not payload.get("access_token"):
+        raise RuntimeError("Resposta de autenticacao CND sem access_token.")
+    return payload
+
+
+def headers_cnd(access_token: str, request_tag: str = "") -> Dict[str, str]:
+    out = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    tag = str(request_tag or "").strip()
+    if tag:
+        out["X-Request-Tag"] = tag[:32]
+    return out
 
 
 def extrair_protocolo(payload: Dict[str, Any]) -> Optional[str]:
@@ -817,6 +918,126 @@ def emitir_parcelamento(
     return retorno
 
 
+def emitir_cnd(
+    session: requests.Session,
+    access_token: str,
+    contribuinte_documento: str,
+    cnd_config: Dict[str, str],
+    return_pdf_base64: bool = True,
+) -> Dict[str, Any]:
+    doc = digits(contribuinte_documento)
+    if len(doc) not in (8, 11, 14):
+        raise ValueError("Documento invalido para CND. Informe CNPJ (14), CPF (11) ou NIRF (8).")
+
+    tipo_contribuinte = infer_cnd_tipo_contribuinte(doc)
+    codigo_identificacao = infer_cnd_codigo_identificacao(tipo_contribuinte)
+
+    request_tag = cnd_config.get("request_tag", "")
+    certidao_url = cnd_config["certidao_url"]
+    max_tentativas = int(cnd_config["max_tentativas"])
+    wait_status7_ms = int(cnd_config["status7_wait_ms"])
+    wait_seconds = max(0.5, wait_status7_ms / 1000.0)
+
+    chave = ""
+    ultimo_payload: Dict[str, Any] = {}
+    ultimo_http_status = 0
+
+    for tentativa in range(1, max_tentativas + 1):
+        req_body = body_cnd_consultar(
+            documento=doc,
+            gerar_certidao_pdf=return_pdf_base64,
+            chave=chave,
+            tipo_contribuinte=tipo_contribuinte,
+            codigo_identificacao=codigo_identificacao,
+        )
+        ultimo_http_status, ultimo_payload = post_cnd_json(
+            session=session,
+            url=certidao_url,
+            headers=headers_cnd(access_token, request_tag),
+            body=req_body,
+        )
+
+        status_api = first_not_empty(ultimo_payload, "Status", "status")
+        try:
+            status_api_int = int(str(status_api))
+        except Exception:
+            status_api_int = None
+
+        certidao = ultimo_payload.get("Certidao") if isinstance(ultimo_payload.get("Certidao"), dict) else {}
+        pdf_b64 = first_not_empty(certidao, "DocumentoPdf", "documentoPdf", "pdf")
+
+        # Status 7: aguardar e repetir a chamada informando a chave.
+        if status_api_int == 7:
+            chave = str(first_not_empty(ultimo_payload, "Chave", "chave") or "").strip()
+            if not chave:
+                break
+            if tentativa < max_tentativas:
+                time.sleep(wait_seconds)
+                continue
+
+        # Status 5 e 6: a documentacao orienta repetir a requisicao.
+        if status_api_int in (5, 6) and tentativa < max_tentativas:
+            chave = ""
+            time.sleep(wait_seconds)
+            continue
+
+        is_success = status_api_int in (1, 2)
+        retorno: Dict[str, Any] = {
+            "ok": is_success,
+            "servico": "cnd_consultar",
+            "documento_consulta": doc,
+            "cnpj": doc if len(doc) == 14 else "",
+            "cpf": doc if len(doc) == 11 else "",
+            "nirf": doc if len(doc) == 8 else "",
+            "tipo_contribuinte": tipo_contribuinte,
+            "codigo_identificacao": codigo_identificacao,
+            "status_http": ultimo_http_status,
+            "status_cnd": status_api_int,
+            "mensagem": first_not_empty(ultimo_payload, "Mensagem", "mensagem", "message", "raw"),
+            "chave": str(first_not_empty(ultimo_payload, "Chave", "chave") or chave or ""),
+            "certidao": certidao,
+        }
+        if return_pdf_base64:
+            retorno["pdf_base64"] = str(pdf_b64 or "")
+        if not is_success:
+            retorno["erro"] = str(retorno["mensagem"] or "Consulta CND nao concluida com sucesso.")
+        return retorno
+
+    raise RuntimeError(
+        first_not_empty(ultimo_payload, "Mensagem", "mensagem", "message", "raw")
+        or "Consulta CND excedeu o numero maximo de tentativas para finalizar o status 7."
+    )
+
+
+def emitir_cnd_um_cnpj_safe(
+    access_token: str,
+    contribuinte_documento: str,
+    cnd_config: Dict[str, str],
+    return_pdf_base64: bool = True,
+) -> Dict[str, Any]:
+    try:
+        with requests.Session() as session:
+            return emitir_cnd(
+                session=session,
+                access_token=access_token,
+                contribuinte_documento=contribuinte_documento,
+                cnd_config=cnd_config,
+                return_pdf_base64=return_pdf_base64,
+            )
+    except Exception as item_exc:
+        doc = digits(contribuinte_documento)
+        return {
+            "ok": False,
+            "servico": "cnd_consultar",
+            "documento_consulta": doc,
+            "cnpj": doc if len(doc) == 14 else "",
+            "cpf": doc if len(doc) == 11 else "",
+            "nirf": doc if len(doc) == 8 else "",
+            "pdf_base64": "",
+            "erro": f"Falha ao consultar CND no lote: {item_exc}",
+        }
+
+
 def consultar_caixa_postal_lista(
     session: requests.Session,
     cert: Tuple[str, str],
@@ -905,6 +1126,139 @@ def consultar_caixa_postal_indicador(
         "cnpj": cnpj_contribuinte,
         "resumo": summarize_caixa_postal_indicador_payload(resposta, cnpj_contribuinte),
     }
+
+
+def parse_bool_field(value: Any, default: bool = False) -> bool:
+    if value in (None, ""):
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in ("1", "true", "t", "sim", "s", "yes", "y", "on"):
+        return True
+    if normalized in ("0", "false", "f", "nao", "n", "no", "off"):
+        return False
+    return default
+
+
+def sanitize_user_folder_name(user: str) -> str:
+    normalized = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(user or "").strip())
+    normalized = normalized.strip("._-")
+    return normalized or "user"
+
+
+def resolve_cnd_config(payload: Dict[str, Any]) -> Dict[str, str]:
+    certidao_url = str(
+        payload.get("cnd_certidao_url")
+        or payload.get("cnd_url")
+        or CND_CERTIDAO_URL
+    ).strip()
+    token_url = str(payload.get("cnd_token_url") or CND_TOKEN_URL).strip() or CND_TOKEN_URL
+    request_tag = str(payload.get("cnd_request_tag") or payload.get("x_request_tag") or "").strip()
+
+    max_tentativas_raw = payload.get("cnd_max_tentativas", CND_MAX_TENTATIVAS)
+    status7_wait_ms_raw = payload.get("cnd_status7_wait_ms", CND_STATUS7_WAIT_MS)
+
+    try:
+        max_tentativas = int(str(max_tentativas_raw).strip())
+    except Exception:
+        max_tentativas = CND_MAX_TENTATIVAS
+    try:
+        status7_wait_ms = int(str(status7_wait_ms_raw).strip())
+    except Exception:
+        status7_wait_ms = CND_STATUS7_WAIT_MS
+
+    max_tentativas = max(1, min(max_tentativas, 60))
+    status7_wait_ms = max(500, min(status7_wait_ms, 30_000))
+
+    if not certidao_url.lower().startswith(("http://", "https://")):
+        raise ValueError("Campo cnd_certidao_url invalido.")
+    if not token_url.lower().startswith(("http://", "https://")):
+        raise ValueError("Campo cnd_token_url invalido.")
+
+    return {
+        "certidao_url": certidao_url,
+        "token_url": token_url,
+        "request_tag": request_tag[:32],
+        "max_tentativas": str(max_tentativas),
+        "status7_wait_ms": str(status7_wait_ms),
+    }
+
+
+def ensure_cnd_user_dir(user: str) -> str:
+    base_dir = os.path.join(os.getcwd(), CND_OUTPUT_DIR)
+    user_dir = os.path.join(base_dir, sanitize_user_folder_name(user))
+    os.makedirs(user_dir, exist_ok=True)
+    return user_dir
+
+
+def write_json_file(path: str, payload: Any) -> None:
+    with open(path, "w", encoding="utf-8") as fp:
+        json.dump(payload, fp, ensure_ascii=False, indent=2)
+
+
+def save_cnd_lote_results(
+    user: str,
+    resultados: List[Dict[str, Any]],
+    max_workers: int,
+    cnd_config: Dict[str, str],
+) -> Dict[str, Any]:
+    generated_at = datetime.now().isoformat(timespec="seconds")
+    user_dir = ensure_cnd_user_dir(user)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    consolidado = {
+        "ok": all(item.get("ok") for item in resultados),
+        "user": user,
+        "gerado_em": generated_at,
+        "total_cnpjs": len(resultados),
+        "max_workers": max_workers,
+        "servico": "cnd_consultar_lote",
+        "cnd_certidao_url": cnd_config["certidao_url"],
+        "cnd_token_url": cnd_config["token_url"],
+        "cnd_request_tag": cnd_config.get("request_tag", ""),
+        "resultados": resultados,
+    }
+
+    for item in resultados:
+        documento = digits(
+            first_not_empty(
+                item,
+                "documento_consulta",
+                "cnpj",
+                "cpf",
+                "nirf",
+            )
+        )
+        if not documento:
+            continue
+        per_doc_path = os.path.join(user_dir, f"{documento}.json")
+        write_json_file(per_doc_path, item)
+
+    latest_path = os.path.join(user_dir, "consolidado.json")
+    historical_path = os.path.join(user_dir, f"consolidado_{timestamp}.json")
+    write_json_file(latest_path, consolidado)
+    write_json_file(historical_path, consolidado)
+
+    consolidado["arquivos"] = {
+        "pasta_user": user_dir,
+        "consolidado": latest_path,
+        "consolidado_historico": historical_path,
+    }
+    return consolidado
+
+
+def read_cnd_consolidado(user: str, file_name: str = "consolidado.json") -> Dict[str, Any]:
+    user_dir = ensure_cnd_user_dir(user)
+    sanitized_name = os.path.basename(str(file_name or "consolidado.json").strip()) or "consolidado.json"
+    path = os.path.join(user_dir, sanitized_name)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Arquivo nao encontrado para o user informado: {sanitized_name}")
+    with open(path, "r", encoding="utf-8") as fp:
+        content = json.load(fp)
+    if isinstance(content, dict):
+        content.setdefault("arquivo", path)
+    return content
 
 
 def get_common_credentials(payload: Dict[str, Any]) -> Tuple[str, str, str]:
@@ -1218,6 +1572,190 @@ def consultar_parcelamento_com_sitfis_route():
                 pass
 
 
+@app.post("/integra-cnd/certidoes/emitir")
+def emitir_cnd_route():
+    payload = request.get_json(silent=True) or {}
+    consumer_key, consumer_secret, _ = get_common_credentials(payload)
+    contribuinte_documento = digits(
+        payload.get("contribuinte_cnpj")
+        or payload.get("cnpj")
+        or payload.get("documento")
+        or payload.get("contribuinte")
+    )
+    return_pdf_base64 = parse_bool_field(payload.get("return_pdf_base64"), default=True)
+
+    if not consumer_key or not consumer_secret:
+        return jsonify({"ok": False, "erro": "Informe consumer_key e consumer_secret."}), 400
+    if len(contribuinte_documento) not in (8, 11, 14):
+        return jsonify({"ok": False, "erro": "Informe CNPJ (14), CPF (11) ou NIRF (8)."}), 400
+
+    try:
+        cnd_config = resolve_cnd_config(payload)
+    except ValueError as exc:
+        return jsonify({"ok": False, "erro": str(exc)}), 400
+
+    try:
+        with requests.Session() as session:
+            auth = authenticate_cnd(
+                session=session,
+                consumer_key=consumer_key,
+                consumer_secret=consumer_secret,
+                token_url=cnd_config["token_url"],
+            )
+            resultado = emitir_cnd(
+                session=session,
+                access_token=auth["access_token"],
+                contribuinte_documento=contribuinte_documento,
+                cnd_config=cnd_config,
+                return_pdf_base64=return_pdf_base64,
+            )
+        resultado["tokens"] = {"expires_in": auth.get("expires_in")}
+        return jsonify(resultado)
+    except requests.HTTPError as exc:
+        detail = exc.response.text if exc.response is not None else str(exc)
+        return jsonify({"ok": False, "erro": detail}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "erro": str(exc)}), 500
+
+
+@app.post("/integra-cnd/certidoes/consultar")
+@app.post("/integra-cnd/certidoes/emitir-lote")
+def emitir_cnd_lote_route():
+    payload = request.get_json(silent=True) or {}
+    user = str(payload.get("user") or "").strip()
+    consumer_key, consumer_secret, _ = get_common_credentials(payload)
+    cnpjs = (
+        payload.get("cnpjs")
+        or payload.get("contribuintes")
+        or payload.get("lista_cnpj")
+        or payload.get("documentos")
+        or payload.get("lista_documentos")
+        or []
+    )
+    max_workers_raw = payload.get("max_workers", os.getenv("CND_MAX_WORKERS", "2"))
+    # O consolidado do lote precisa carregar o PDF em base64 para o frontend.
+    return_pdf_base64 = True
+
+    if isinstance(cnpjs, str):
+        cnpjs = [x for x in re.split(r"[\s,;]+", cnpjs) if x]
+    cnpjs = [digits(cnpj) for cnpj in cnpjs]
+    cnpjs = [cnpj for cnpj in dict.fromkeys(cnpjs) if len(cnpj) in (8, 11, 14)]
+
+    if not user:
+        return jsonify({"ok": False, "erro": "Informe o user."}), 400
+    if not consumer_key or not consumer_secret:
+        return jsonify({"ok": False, "erro": "Informe consumer_key e consumer_secret."}), 400
+    if not cnpjs:
+        return jsonify({"ok": False, "erro": "Informe uma lista de CNPJs/CPFs/NIRFs."}), 400
+
+    try:
+        cnd_config = resolve_cnd_config(payload)
+    except ValueError as exc:
+        return jsonify({"ok": False, "user": user, "erro": str(exc)}), 400
+
+    try:
+        max_workers = int(str(max_workers_raw).strip())
+    except Exception:
+        max_workers = 2
+    max_workers = max(1, min(max_workers, 8))
+
+    try:
+        with requests.Session() as auth_session:
+            auth = authenticate_cnd(
+                session=auth_session,
+                consumer_key=consumer_key,
+                consumer_secret=consumer_secret,
+                token_url=cnd_config["token_url"],
+            )
+
+        resultados: List[Dict[str, Any]] = []
+        if max_workers <= 1 or len(cnpjs) <= 1:
+            for cnpj in cnpjs:
+                resultados.append(
+                    emitir_cnd_um_cnpj_safe(
+                        access_token=auth["access_token"],
+                        contribuinte_documento=cnpj,
+                        cnd_config=cnd_config,
+                        return_pdf_base64=return_pdf_base64,
+                    )
+                )
+        else:
+            ordered_results: List[Optional[Dict[str, Any]]] = [None] * len(cnpjs)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(
+                        emitir_cnd_um_cnpj_safe,
+                        auth["access_token"],
+                        cnpj,
+                        cnd_config,
+                        return_pdf_base64,
+                    ): idx
+                    for idx, cnpj in enumerate(cnpjs)
+                }
+                for future in as_completed(future_map):
+                    idx = future_map[future]
+                    try:
+                        ordered_results[idx] = future.result()
+                    except Exception as exc:
+                        ordered_results[idx] = {
+                            "ok": False,
+                            "servico": "cnd_consultar",
+                            "documento_consulta": cnpjs[idx],
+                            "cnpj": cnpjs[idx] if len(cnpjs[idx]) == 14 else "",
+                            "cpf": cnpjs[idx] if len(cnpjs[idx]) == 11 else "",
+                            "nirf": cnpjs[idx] if len(cnpjs[idx]) == 8 else "",
+                            "pdf_base64": "",
+                            "erro": f"Falha ao consultar CND no lote: {exc}",
+                        }
+
+            resultados = [
+                item if item is not None else {
+                    "ok": False,
+                    "servico": "cnd_consultar",
+                    "documento_consulta": cnpjs[idx],
+                    "cnpj": cnpjs[idx] if len(cnpjs[idx]) == 14 else "",
+                    "cpf": cnpjs[idx] if len(cnpjs[idx]) == 11 else "",
+                    "nirf": cnpjs[idx] if len(cnpjs[idx]) == 8 else "",
+                    "pdf_base64": "",
+                    "erro": "Falha interna ao consolidar resultado no lote.",
+                }
+                for idx, item in enumerate(ordered_results)
+            ]
+
+        consolidado = save_cnd_lote_results(
+            user=user,
+            resultados=resultados,
+            max_workers=max_workers,
+            cnd_config=cnd_config,
+        )
+        consolidado["tokens"] = {"expires_in": auth.get("expires_in")}
+        return jsonify(consolidado)
+    except Exception as exc:
+        return jsonify({"ok": False, "user": user, "erro": str(exc)}), 500
+
+
+@app.post("/integra-cnd/certidoes/exibir-lote")
+def exibir_cnd_lote_route():
+    payload = request.get_json(silent=True) or {}
+    user = str(payload.get("user") or "").strip()
+    arquivo = str(payload.get("arquivo") or "consolidado.json").strip() or "consolidado.json"
+
+    if not user:
+        return jsonify({"ok": False, "erro": "Informe o user."}), 400
+
+    try:
+        consolidado = read_cnd_consolidado(user=user, file_name=arquivo)
+        if isinstance(consolidado, dict):
+            consolidado.setdefault("user", user)
+            consolidado.setdefault("ok", True)
+            return jsonify(consolidado)
+        return jsonify({"ok": True, "user": user, "dados": consolidado})
+    except FileNotFoundError as exc:
+        return jsonify({"ok": False, "user": user, "erro": str(exc)}), 404
+    except Exception as exc:
+        return jsonify({"ok": False, "user": user, "erro": str(exc)}), 500
+
+
 @app.post("/integra-caixapostal/caixa-entrada/consultar")
 @app.post("/integra-caixapostal/mensagens/consultar")
 def consultar_caixa_postal_caixa_entrada_route():
@@ -1411,6 +1949,10 @@ def health():
             "/integra-parcelamento/parcelamentos/consultar",
             "/integra-parcelamento/parcelamentos/emitir",
             "/integra-parcelamento/parcelamentos/consultar-com-sitfis",
+            "/integra-cnd/certidoes/emitir",
+            "/integra-cnd/certidoes/consultar",
+            "/integra-cnd/certidoes/emitir-lote",
+            "/integra-cnd/certidoes/exibir-lote",
             "/integra-caixapostal/caixa-entrada/consultar",
             "/integra-caixapostal/mensagens/consultar",
             "/integra-caixapostal/mensagens/detalhar",
