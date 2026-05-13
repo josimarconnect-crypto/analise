@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import base64
 import logging
@@ -60,6 +60,14 @@ if not logger.handlers:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _cors_headers_for_request(request: Request) -> Dict[str, str]:
+    origin = request.headers.get("origin") or "*"
+    headers = {"Access-Control-Allow-Origin": origin}
+    if origin != "*":
+        headers["Vary"] = "Origin"
+    return headers
 
 
 def _require_supabase() -> None:
@@ -297,7 +305,7 @@ def _extrair_token_e_usuario(html_extrato: str) -> Tuple[Optional[str], Optional
     token_match = re.search(r"var\s+TOKEN\s*=\s*'([^']+)'", html_extrato)
     token = token_match.group(1).strip() if token_match else None
 
-    user_match = re.search(r"Ol[áa]\s*<strong>\s*([0-9]{11})\s*-", html_extrato, flags=re.I)
+    user_match = re.search(r"Ol[Ã¡a]\s*<strong>\s*([0-9]{11})\s*-", html_extrato, flags=re.I)
     if user_match:
         return token, user_match.group(1).strip()
 
@@ -407,21 +415,21 @@ def _buscar_chaves_cte(sess: requests.Session, url_cteconsulta: str) -> List[str
 def _norm_text(text: str) -> str:
     normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
     for src, dst in [
-        ("á", "a"),
-        ("à", "a"),
-        ("â", "a"),
-        ("ã", "a"),
-        ("é", "e"),
-        ("ê", "e"),
-        ("è", "e"),
-        ("í", "i"),
-        ("î", "i"),
-        ("ó", "o"),
-        ("ô", "o"),
-        ("õ", "o"),
-        ("ú", "u"),
-        ("û", "u"),
-        ("ç", "c"),
+        ("Ã¡", "a"),
+        ("Ã ", "a"),
+        ("Ã¢", "a"),
+        ("Ã£", "a"),
+        ("Ã©", "e"),
+        ("Ãª", "e"),
+        ("Ã¨", "e"),
+        ("Ã­", "i"),
+        ("Ã®", "i"),
+        ("Ã³", "o"),
+        ("Ã´", "o"),
+        ("Ãµ", "o"),
+        ("Ãº", "u"),
+        ("Ã»", "u"),
+        ("Ã§", "c"),
     ]:
         normalized = normalized.replace(src, dst)
     return normalized
@@ -538,7 +546,15 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
     except Exception:
         pass
 
+    status_code = 500
+    if isinstance(exc, requests.exceptions.Timeout):
+        status_code = 504
+    elif isinstance(exc, requests.exceptions.RequestException):
+        status_code = 502
+
     payload: Dict[str, Any] = {"ok": False, "error": str(exc)}
+    if isinstance(exc, requests.exceptions.RequestException):
+        payload["detail"] = "Falha ao conectar em servico externo usado pela consulta."
     if DEBUG_ERRORS:
         payload.update(
             {
@@ -549,7 +565,11 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
                 "log_file": LOG_FILE,
             }
         )
-    return JSONResponse(status_code=500, content=payload)
+    return JSONResponse(
+        status_code=status_code,
+        content=payload,
+        headers=_cors_headers_for_request(request),
+    )
 
 
 @app.get("/")
