@@ -50,6 +50,10 @@ try:
     RUNTIME_PORT = int(os.getenv("PORT", "10003"))
 except ValueError:
     RUNTIME_PORT = 10003
+
+# IP publico usado apenas para montar os links exibidos no painel/log.
+# Para a porta ficar acessivel externamente, o servidor deve escutar em 0.0.0.0.
+PUBLIC_HOST = (os.getenv("PUBLIC_HOST") or os.getenv("PUBLIC_IP") or "51.81.105.124").strip()
 ADMIN_USER = (os.getenv("ADMIN_USER") or os.getenv("PAINEL_USER") or "").strip()
 ADMIN_PASSWORD = (os.getenv("ADMIN_PASSWORD") or os.getenv("PAINEL_PASSWORD") or "").strip()
 PROXY_HOST = (os.getenv("PROXY_HOST") or os.getenv("PROXY_IP") or "").strip()
@@ -219,7 +223,8 @@ def _host_for_local_url(host: str) -> str:
 
 
 def _panel_url() -> str:
-    return f"http://{_host_for_local_url(RUNTIME_HOST)}:{RUNTIME_PORT}/painel"
+    display_host = PUBLIC_HOST or _host_for_local_url(RUNTIME_HOST)
+    return f"http://{display_host}:{RUNTIME_PORT}/painel"
 
 
 def _runtime_status() -> Dict[str, Any]:
@@ -231,6 +236,7 @@ def _runtime_status() -> Dict[str, Any]:
         "started_at_utc": APP_START_TIME.isoformat(),
         "uptime_seconds": int((datetime.now(timezone.utc) - APP_START_TIME).total_seconds()),
         "host": RUNTIME_HOST,
+        "public_host": PUBLIC_HOST,
         "port": RUNTIME_PORT,
         "panel_url": _panel_url(),
         "admin_auth": _admin_auth_enabled(),
@@ -1457,20 +1463,24 @@ def _apply_runtime_config(
     port: int,
     admin_user: str = "",
     admin_password: str = "",
+    public_host: str = "",
     proxy_host: str = "",
     proxy_port: str = "",
     proxy_user: str = "",
     proxy_password: str = "",
     proxy_scheme: str = "http",
 ) -> None:
-    global RUNTIME_HOST, RUNTIME_PORT, ADMIN_USER, ADMIN_PASSWORD
+    global RUNTIME_HOST, RUNTIME_PORT, ADMIN_USER, ADMIN_PASSWORD, PUBLIC_HOST
     RUNTIME_HOST = (host or "0.0.0.0").strip() or "0.0.0.0"
     RUNTIME_PORT = _parse_port_value(port)
+    PUBLIC_HOST = (public_host or PUBLIC_HOST or "").strip()
     ADMIN_USER = (admin_user or "").strip()
     ADMIN_PASSWORD = admin_password or ""
     _apply_proxy_config(proxy_host, proxy_port, proxy_user, proxy_password, proxy_scheme)
     os.environ["HOST"] = RUNTIME_HOST
     os.environ["PORT"] = str(RUNTIME_PORT)
+    if PUBLIC_HOST:
+        os.environ["PUBLIC_HOST"] = PUBLIC_HOST
     if ADMIN_USER:
         os.environ["ADMIN_USER"] = ADMIN_USER
     if ADMIN_PASSWORD:
@@ -1524,6 +1534,7 @@ def run_server(
     port: int,
     admin_user: str = "",
     admin_password: str = "",
+    public_host: str = "",
     proxy_host: str = "",
     proxy_port: str = "",
     proxy_user: str = "",
@@ -1536,6 +1547,7 @@ def run_server(
         port,
         admin_user,
         admin_password,
+        public_host,
         proxy_host,
         proxy_port,
         proxy_user,
@@ -1551,8 +1563,9 @@ def run_server(
         _proxy_status_text(),
     )
     logger.info(
-        "PAINEL | local=%s | rede=http://IP_DA_VPS:%s/painel | gui=python analise.py --gui",
+        "PAINEL | local=%s | rede=http://%s:%s/painel | gui=python analise.py --gui",
         _panel_url(),
+        PUBLIC_HOST or "IP_DA_VPS",
         RUNTIME_PORT,
     )
     if open_browser:
@@ -1578,6 +1591,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Servidor da API Analise.")
     parser.add_argument("--host", "--ip", dest="host", default=RUNTIME_HOST, help="IP/host para abrir a porta.")
     parser.add_argument("-p", "--port", dest="port", type=_parse_port_value, default=RUNTIME_PORT, help="Porta da API.")
+    parser.add_argument("--public-host", "--public-ip", dest="public_host", default=PUBLIC_HOST, help="IP publico usado nos links do painel.")
     parser.add_argument("--admin-user", default=ADMIN_USER, help="Usuario do painel web.")
     parser.add_argument("--admin-password", default=ADMIN_PASSWORD, help="Senha do painel web.")
     parser.add_argument("--proxy-host", "--proxy-ip", dest="proxy_host", default=PROXY_HOST, help="IP/host do proxy.")
@@ -1596,14 +1610,14 @@ def launch_gui() -> None:
         from tkinter import messagebox, ttk
     except Exception as exc:
         print(f"Nao foi possivel abrir a interface grafica: {exc}")
-        run_server(RUNTIME_HOST, RUNTIME_PORT, ADMIN_USER, ADMIN_PASSWORD, open_browser=True)
+        run_server(RUNTIME_HOST, RUNTIME_PORT, ADMIN_USER, ADMIN_PASSWORD, PUBLIC_HOST, open_browser=True)
         return
 
     try:
         root = tk.Tk()
     except Exception as exc:
         print(f"Nao foi possivel iniciar a janela grafica: {exc}")
-        run_server(RUNTIME_HOST, RUNTIME_PORT, ADMIN_USER, ADMIN_PASSWORD, open_browser=True)
+        run_server(RUNTIME_HOST, RUNTIME_PORT, ADMIN_USER, ADMIN_PASSWORD, PUBLIC_HOST, open_browser=True)
         return
 
     root.title("Analise - Servidor")
@@ -1687,6 +1701,7 @@ def launch_gui() -> None:
             port,
             admin_user,
             admin_password,
+            PUBLIC_HOST,
             proxy_host_var.get(),
             proxy_port,
             proxy_user_var.get(),
@@ -1762,8 +1777,10 @@ def launch_gui() -> None:
 
 def main(argv: Optional[List[str]] = None) -> None:
     raw_args = sys.argv[1:] if argv is None else argv
+    # Sem argumentos, inicia direto como servidor na porta padrao 10003.
+    # Use --gui se quiser abrir a interface grafica.
     if not raw_args and os.name == "nt" and not os.getenv("RENDER"):
-        launch_gui()
+        run_server(RUNTIME_HOST, RUNTIME_PORT, ADMIN_USER, ADMIN_PASSWORD, PUBLIC_HOST)
         return
 
     args = _parse_args(raw_args)
@@ -1775,6 +1792,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         args.port,
         args.admin_user,
         args.admin_password,
+        args.public_host,
         args.proxy_host,
         args.proxy_port,
         args.proxy_user,
