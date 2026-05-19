@@ -126,6 +126,15 @@ def post_json(
     return resp.status_code, payload
 
 
+class PgdasdUpstreamError(RuntimeError):
+    def __init__(self, message: str, status: int, resposta: Dict[str, Any], url: str, body: Dict[str, Any]):
+        super().__init__(message)
+        self.status = int(status or 500)
+        self.resposta = resposta
+        self.url = url
+        self.body = body
+
+
 def first_not_empty(mapping: Dict[str, Any], *keys: str) -> Any:
     for key in keys:
         value = mapping.get(key)
@@ -1208,7 +1217,17 @@ def executar_pgdasd(
         cert,
     )
     if status >= 400:
-        raise RuntimeError(first_not_empty(resposta, "mensagem", "message", "raw") or "Falha ao executar PGDAS-D.")
+        dados_parseados = resposta.get("dados_parseados")
+        mensagem = first_not_empty(resposta, "mensagem", "message", "erro", "error", "raw")
+        if not mensagem and isinstance(dados_parseados, dict):
+            mensagem = first_not_empty(dados_parseados, "mensagem", "message", "erro", "error")
+        raise PgdasdUpstreamError(
+            str(mensagem or "Falha ao executar PGDAS-D."),
+            status=status,
+            resposta=resposta,
+            url=url,
+            body=body,
+        )
 
     return {
         "ok": True,
@@ -2087,6 +2106,16 @@ def executar_pgdasd_route():
     except requests.HTTPError as exc:
         detail = exc.response.text if exc.response is not None else str(exc)
         return jsonify({"ok": False, "erro": detail}), 400
+    except PgdasdUpstreamError as exc:
+        pedido_dados_enviado = (exc.body or {}).get("pedidoDados", {})
+        return jsonify({
+            "ok": False,
+            "erro": str(exc),
+            "status_serpro": exc.status,
+            "endpoint_serpro": exc.url,
+            "retorno_serpro": exc.resposta,
+            "pedidoDados": pedido_dados_enviado,
+        }), 502
     except Exception as exc:
         return jsonify({"ok": False, "erro": str(exc)}), 500
     finally:
