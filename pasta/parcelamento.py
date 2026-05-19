@@ -32,6 +32,9 @@ URL_PARCELAMENTO_CONSULTAR = API_BASE.rstrip("/") + "/Consultar"
 URL_PARCELAMENTO_EMITIR = API_BASE.rstrip("/") + "/Emitir"
 URL_SITFIS_APOIAR = API_BASE.rstrip("/") + "/Apoiar"
 URL_SITFIS_EMITIR = API_BASE.rstrip("/") + "/Emitir"
+URL_INTEGRA_CONSULTAR = API_BASE.rstrip("/") + "/Consultar"
+URL_INTEGRA_EMITIR = API_BASE.rstrip("/") + "/Emitir"
+URL_INTEGRA_DECLARAR = API_BASE.rstrip("/") + "/Declarar"
 
 ID_SISTEMA = "SITFIS"
 ID_SERVICO_APOIAR = "SOLICITARPROTOCOLO91"
@@ -49,6 +52,9 @@ CAIXAPOSTAL_ID_SERVICO_LISTA = os.getenv("CAIXAPOSTAL_ID_SERVICO_LISTA", "MSGCON
 CAIXAPOSTAL_ID_SERVICO_DETALHE = os.getenv("CAIXAPOSTAL_ID_SERVICO_DETALHE", "MSGDETALHAMENTO62")
 CAIXAPOSTAL_ID_SERVICO_INDICADOR = os.getenv("CAIXAPOSTAL_ID_SERVICO_INDICADOR", "INNOVAMSG63")
 CAIXAPOSTAL_VERSAO = os.getenv("CAIXAPOSTAL_VERSAO", "1.0")
+
+PGDASD_ID_SISTEMA = os.getenv("PGDASD_ID_SISTEMA", "PGDASD")
+PGDASD_VERSAO = os.getenv("PGDASD_VERSAO", "1.0")
 
 CND_TOKEN_URL = os.getenv("CND_TOKEN_URL", "https://gateway.apiserpro.serpro.gov.br/token").strip()
 CND_CERTIDAO_URL = os.getenv(
@@ -246,6 +252,38 @@ def body_caixa_postal_indicador(cnpj_contador: str, cnpj_contribuinte: str) -> D
             "idServico": CAIXAPOSTAL_ID_SERVICO_INDICADOR,
             "versaoSistema": CAIXAPOSTAL_VERSAO,
             "dados": "",
+        },
+    }
+
+
+def encode_pedido_dados(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    if isinstance(value, str):
+        parsed = try_json(value)
+        if isinstance(parsed, (dict, list)):
+            return json.dumps(parsed, ensure_ascii=False)
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def body_pgdasd_executar(
+    cnpj_contador: str,
+    cnpj_contribuinte: str,
+    id_servico: str,
+    dados: Any,
+    id_sistema: str = PGDASD_ID_SISTEMA,
+    versao_sistema: str = PGDASD_VERSAO,
+) -> Dict[str, Any]:
+    return {
+        "contratante": {"numero": cnpj_contador, "tipo": 2},
+        "autorPedidoDados": {"numero": cnpj_contador, "tipo": 2},
+        "contribuinte": {"numero": cnpj_contribuinte, "tipo": infer_document_type(cnpj_contribuinte)},
+        "pedidoDados": {
+            "idSistema": id_sistema or PGDASD_ID_SISTEMA,
+            "idServico": id_servico,
+            "versaoSistema": versao_sistema or PGDASD_VERSAO,
+            "dados": encode_pedido_dados(dados),
         },
     }
 
@@ -1128,6 +1166,65 @@ def consultar_caixa_postal_indicador(
     }
 
 
+def executar_pgdasd(
+    session: requests.Session,
+    cert: Tuple[str, str],
+    access_token: str,
+    jwt_token: str,
+    cnpj_contador: str,
+    cnpj_contribuinte: str,
+    endpoint: str,
+    id_sistema: str,
+    id_servico: str,
+    versao_sistema: str,
+    dados: Any,
+) -> Dict[str, Any]:
+    endpoint_key = str(endpoint or "Consultar").strip().lower()
+    url_map = {
+        "consultar": URL_INTEGRA_CONSULTAR,
+        "consulta": URL_INTEGRA_CONSULTAR,
+        "emitir": URL_INTEGRA_EMITIR,
+        "emissao": URL_INTEGRA_EMITIR,
+        "declarar": URL_INTEGRA_DECLARAR,
+        "declaracao": URL_INTEGRA_DECLARAR,
+    }
+    url = url_map.get(endpoint_key)
+    if not url:
+        raise ValueError("Endpoint PGDAS-D invalido. Use Consultar, Emitir ou Declarar.")
+
+    body = body_pgdasd_executar(
+        cnpj_contador=cnpj_contador,
+        cnpj_contribuinte=cnpj_contribuinte,
+        id_servico=id_servico,
+        dados=dados,
+        id_sistema=id_sistema,
+        versao_sistema=versao_sistema,
+    )
+    status, resposta = post_json(
+        session,
+        url,
+        headers(access_token, jwt_token),
+        body,
+        cert,
+    )
+    if status >= 400:
+        raise RuntimeError(first_not_empty(resposta, "mensagem", "message", "raw") or "Falha ao executar PGDAS-D.")
+
+    return {
+        "ok": True,
+        "servico": "pgdasd_executar",
+        "cnpj": cnpj_contribuinte,
+        "endpoint": endpoint_key,
+        "idSistema": id_sistema,
+        "idServico": id_servico,
+        "versaoSistema": versao_sistema,
+        "dados_enviados": try_json(body["pedidoDados"].get("dados")),
+        "retorno": resposta,
+        "dados": resposta.get("dados"),
+        "dados_parseados": resposta.get("dados_parseados"),
+    }
+
+
 def parse_bool_field(value: Any, default: bool = False) -> bool:
     if value in (None, ""):
         return default
@@ -1938,6 +2035,68 @@ def consultar_caixa_postal_indicador_route():
                 pass
 
 
+@app.post("/integra-sn/pgdasd/executar")
+def executar_pgdasd_route():
+    payload = request.get_json(silent=True) or {}
+    consumer_key, consumer_secret, cnpj_contador = get_common_credentials(payload)
+    contribuinte_cnpj = digits(payload.get("contribuinte_cnpj") or payload.get("cnpj"))
+    pedido_dados = payload.get("pedidoDados") if isinstance(payload.get("pedidoDados"), dict) else {}
+    endpoint = str(payload.get("endpoint") or "Consultar").strip()
+    id_sistema = str(payload.get("idSistema") or pedido_dados.get("idSistema") or PGDASD_ID_SISTEMA).strip()
+    id_servico = str(payload.get("idServico") or pedido_dados.get("idServico") or "").strip()
+    versao_sistema = str(payload.get("versaoSistema") or pedido_dados.get("versaoSistema") or PGDASD_VERSAO).strip()
+    dados = payload.get("dados")
+    if dados in (None, ""):
+        dados = pedido_dados.get("dados", "")
+
+    if len(cnpj_contador) != 14:
+        return jsonify({"ok": False, "erro": "Informe o CNPJ do contador com 14 digitos."}), 400
+    if len(contribuinte_cnpj) not in (11, 14):
+        return jsonify({"ok": False, "erro": "Informe o CPF/CNPJ do contribuinte com 11 ou 14 digitos."}), 400
+    if not consumer_key or not consumer_secret:
+        return jsonify({"ok": False, "erro": "Informe consumer_key e consumer_secret."}), 400
+    if not id_servico:
+        return jsonify({"ok": False, "erro": "Informe idServico para executar o PGDAS-D."}), 400
+    if id_sistema != PGDASD_ID_SISTEMA:
+        return jsonify({"ok": False, "erro": "Esta rota aceita apenas idSistema PGDASD."}), 400
+
+    try:
+        pem_path, key_path = load_cert_paths(payload)
+    except Exception as exc:
+        return jsonify({"ok": False, "erro": f"Certificado invalido: {exc}"}), 400
+
+    try:
+        session = requests.Session()
+        cert = (pem_path, key_path)
+        auth = authenticate(session, consumer_key, consumer_secret, cert)
+        resultado = executar_pgdasd(
+            session=session,
+            cert=cert,
+            access_token=auth["access_token"],
+            jwt_token=auth["jwt_token"],
+            cnpj_contador=cnpj_contador,
+            cnpj_contribuinte=contribuinte_cnpj,
+            endpoint=endpoint,
+            id_sistema=id_sistema,
+            id_servico=id_servico,
+            versao_sistema=versao_sistema,
+            dados=dados,
+        )
+        resultado["tokens"] = {"expires_in": auth.get("expires_in")}
+        return jsonify(resultado)
+    except requests.HTTPError as exc:
+        detail = exc.response.text if exc.response is not None else str(exc)
+        return jsonify({"ok": False, "erro": detail}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "erro": str(exc)}), 500
+    finally:
+        for path in (pem_path, key_path):
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+
 @app.get("/health")
 def health():
     return jsonify({
@@ -1957,6 +2116,7 @@ def health():
             "/integra-caixapostal/mensagens/consultar",
             "/integra-caixapostal/mensagens/detalhar",
             "/integra-caixapostal/mensagens/indicador",
+            "/integra-sn/pgdasd/executar",
         ],
     })
 
