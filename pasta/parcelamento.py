@@ -56,6 +56,10 @@ CAIXAPOSTAL_VERSAO = os.getenv("CAIXAPOSTAL_VERSAO", "1.0")
 PGDASD_ID_SISTEMA = os.getenv("PGDASD_ID_SISTEMA", "PGDASD")
 PGDASD_VERSAO = os.getenv("PGDASD_VERSAO", "1.0")
 
+PROCURACOES_ID_SISTEMA = os.getenv("PROCURACOES_ID_SISTEMA", "PROCURACOES")
+PROCURACOES_ID_SERVICO_OBTER = os.getenv("PROCURACOES_ID_SERVICO_OBTER", "OBTERPROCURACAO41")
+PROCURACOES_VERSAO = os.getenv("PROCURACOES_VERSAO", "1")
+
 CND_TOKEN_URL = os.getenv("CND_TOKEN_URL", "https://gateway.apiserpro.serpro.gov.br/token").strip()
 CND_CERTIDAO_URL = os.getenv(
     "CND_CERTIDAO_URL",
@@ -293,6 +297,34 @@ def body_pgdasd_executar(
             "idServico": id_servico,
             "versaoSistema": versao_sistema or PGDASD_VERSAO,
             "dados": encode_pedido_dados(dados),
+        },
+    }
+
+
+def body_procuracoes_obter(
+    cnpj_contador: str,
+    cnpj_contribuinte: str,
+    outorgante: str,
+    outorgado: str,
+    id_servico: str = PROCURACOES_ID_SERVICO_OBTER,
+    id_sistema: str = PROCURACOES_ID_SISTEMA,
+    versao_sistema: str = PROCURACOES_VERSAO,
+) -> Dict[str, Any]:
+    dados = {
+        "outorgante": digits(outorgante),
+        "tipoOutorgante": str(infer_document_type(outorgante)),
+        "outorgado": digits(outorgado),
+        "tipoOutorgado": str(infer_document_type(outorgado)),
+    }
+    return {
+        "contratante": {"numero": cnpj_contador, "tipo": 2},
+        "autorPedidoDados": {"numero": cnpj_contador, "tipo": 2},
+        "contribuinte": {"numero": cnpj_contribuinte, "tipo": infer_document_type(cnpj_contribuinte)},
+        "pedidoDados": {
+            "idSistema": id_sistema or PROCURACOES_ID_SISTEMA,
+            "idServico": id_servico or PROCURACOES_ID_SERVICO_OBTER,
+            "versaoSistema": versao_sistema or PROCURACOES_VERSAO,
+            "dados": json.dumps(dados, ensure_ascii=False),
         },
     }
 
@@ -1244,6 +1276,58 @@ def executar_pgdasd(
     }
 
 
+def consultar_procuracoes(
+    session: requests.Session,
+    cert: Tuple[str, str],
+    access_token: str,
+    jwt_token: str,
+    cnpj_contador: str,
+    cnpj_contribuinte: str,
+    outorgante: str,
+    outorgado: str,
+    id_sistema: str = PROCURACOES_ID_SISTEMA,
+    id_servico: str = PROCURACOES_ID_SERVICO_OBTER,
+    versao_sistema: str = PROCURACOES_VERSAO,
+) -> Dict[str, Any]:
+    body = body_procuracoes_obter(
+        cnpj_contador=cnpj_contador,
+        cnpj_contribuinte=cnpj_contribuinte,
+        outorgante=outorgante,
+        outorgado=outorgado,
+        id_servico=id_servico,
+        id_sistema=id_sistema,
+        versao_sistema=versao_sistema,
+    )
+    status, resposta = post_json(
+        session,
+        URL_INTEGRA_CONSULTAR,
+        headers(access_token, jwt_token),
+        body,
+        cert,
+    )
+    if status >= 400:
+      mensagem = first_not_empty(resposta, "mensagem", "message", "erro", "error", "raw") or "Falha ao consultar procurações."
+      raise PgdasdUpstreamError(str(mensagem), status=status, resposta=resposta, url=URL_INTEGRA_CONSULTAR, body=body)
+
+    dados = resposta.get("dados_parseados")
+    procuracoes = dados if isinstance(dados, list) else []
+    return {
+        "ok": True,
+        "servico": "procuracoes_obter",
+        "cnpj": cnpj_contribuinte,
+        "idSistema": id_sistema,
+        "idServico": id_servico,
+        "versaoSistema": versao_sistema,
+        "dados_enviados": try_json(body["pedidoDados"].get("dados")),
+        "retorno": resposta,
+        "dados": resposta.get("dados"),
+        "dados_parseados": dados,
+        "procuracoes": procuracoes,
+        "total_procuracoes": len(procuracoes),
+        "gerado_em": datetime.utcnow().isoformat() + "Z",
+    }
+
+
 def parse_bool_field(value: Any, default: bool = False) -> bool:
     if value in (None, ""):
         return default
@@ -2126,6 +2210,86 @@ def executar_pgdasd_route():
                 pass
 
 
+@app.post("/integra-procuracoes/procuracoes/consultar")
+def consultar_procuracoes_route():
+    payload = request.get_json(silent=True) or {}
+    consumer_key, consumer_secret, cnpj_contador = get_common_credentials(payload)
+    contribuinte_cnpj = digits(payload.get("contribuinte_cnpj") or payload.get("cnpj") or payload.get("outorgante"))
+    pedido_dados = payload.get("pedidoDados") if isinstance(payload.get("pedidoDados"), dict) else {}
+    dados_payload = payload.get("dados")
+    if dados_payload in (None, ""):
+        dados_payload = try_json(pedido_dados.get("dados", {}))
+    if not isinstance(dados_payload, dict):
+        dados_payload = {}
+
+    outorgante = digits(payload.get("outorgante") or dados_payload.get("outorgante") or contribuinte_cnpj)
+    outorgado = digits(payload.get("outorgado") or dados_payload.get("outorgado") or payload.get("autor_cnpj") or cnpj_contador)
+    id_sistema = str(payload.get("idSistema") or pedido_dados.get("idSistema") or PROCURACOES_ID_SISTEMA).strip()
+    id_servico = str(payload.get("idServico") or pedido_dados.get("idServico") or PROCURACOES_ID_SERVICO_OBTER).strip()
+    versao_sistema = str(payload.get("versaoSistema") or pedido_dados.get("versaoSistema") or PROCURACOES_VERSAO).strip()
+
+    if len(cnpj_contador) != 14:
+        return jsonify({"ok": False, "erro": "Informe o CNPJ do contador com 14 digitos."}), 400
+    if len(contribuinte_cnpj) not in (11, 14):
+        return jsonify({"ok": False, "erro": "Informe o CPF/CNPJ do contribuinte com 11 ou 14 digitos."}), 400
+    if len(outorgante) not in (11, 14):
+        return jsonify({"ok": False, "erro": "Informe outorgante com CPF/CNPJ valido."}), 400
+    if len(outorgado) not in (11, 14):
+        return jsonify({"ok": False, "erro": "Informe outorgado com CPF/CNPJ valido."}), 400
+    if not consumer_key or not consumer_secret:
+        return jsonify({"ok": False, "erro": "Informe consumer_key e consumer_secret."}), 400
+    if id_sistema != PROCURACOES_ID_SISTEMA:
+        return jsonify({"ok": False, "erro": "Esta rota aceita apenas idSistema PROCURACOES."}), 400
+    if id_servico != PROCURACOES_ID_SERVICO_OBTER:
+        return jsonify({"ok": False, "erro": "Esta rota aceita apenas idServico OBTERPROCURACAO41."}), 400
+
+    try:
+        pem_path, key_path = load_cert_paths(payload)
+    except Exception as exc:
+        return jsonify({"ok": False, "erro": f"Certificado invalido: {exc}"}), 400
+
+    try:
+        session = requests.Session()
+        cert = (pem_path, key_path)
+        auth = authenticate(session, consumer_key, consumer_secret, cert)
+        resultado = consultar_procuracoes(
+            session=session,
+            cert=cert,
+            access_token=auth["access_token"],
+            jwt_token=auth["jwt_token"],
+            cnpj_contador=cnpj_contador,
+            cnpj_contribuinte=contribuinte_cnpj,
+            outorgante=outorgante,
+            outorgado=outorgado,
+            id_sistema=id_sistema,
+            id_servico=id_servico,
+            versao_sistema=versao_sistema,
+        )
+        resultado["tokens"] = {"expires_in": auth.get("expires_in")}
+        return jsonify(resultado)
+    except requests.HTTPError as exc:
+        detail = exc.response.text if exc.response is not None else str(exc)
+        return jsonify({"ok": False, "erro": detail}), 400
+    except PgdasdUpstreamError as exc:
+        pedido_dados_enviado = (exc.body or {}).get("pedidoDados", {})
+        return jsonify({
+            "ok": False,
+            "erro": str(exc),
+            "status_serpro": exc.status,
+            "endpoint_serpro": exc.url,
+            "retorno_serpro": exc.resposta,
+            "pedidoDados": pedido_dados_enviado,
+        }), 502
+    except Exception as exc:
+        return jsonify({"ok": False, "erro": str(exc)}), 500
+    finally:
+        for path in (pem_path, key_path):
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+
 @app.get("/health")
 def health():
     return jsonify({
@@ -2146,6 +2310,7 @@ def health():
             "/integra-caixapostal/mensagens/detalhar",
             "/integra-caixapostal/mensagens/indicador",
             "/integra-sn/pgdasd/executar",
+            "/integra-procuracoes/procuracoes/consultar",
         ],
     })
 
