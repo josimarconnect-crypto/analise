@@ -3107,6 +3107,9 @@ def executar_mit_route():
 
 @app.post("/integra-eprocesso/eprocesso/executar")
 @app.post("/integra-eprocesso/executar")
+@app.post("/integra-eprocesso/eprocesso/consultar")
+@app.post("/integra-eprocesso/processos/consultar")
+@app.post("/integra-eprocesso/consultar")
 def executar_eprocesso_route():
     payload = request.get_json(silent=True) or {}
     consumer_key, consumer_secret, cnpj_contador = get_common_credentials(payload)
@@ -3320,6 +3323,7 @@ def health():
             "/integra-dctfweb/dctfweb/executar",
             "/integra-mit/mit/executar",
             "/integra-eprocesso/eprocesso/executar",
+            "/integra-eprocesso/processos/consultar",
             "/integra-monitoramento/eventos/executar",
         ],
     })
