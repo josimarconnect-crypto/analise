@@ -2545,6 +2545,7 @@ def executar_pagtoweb_route():
 
 
 @app.post("/integra-dctfweb/dctfweb/executar")
+@app.post("/integra-dctfweb/executar")
 def executar_dctfweb_route():
     payload = request.get_json(silent=True) or {}
     consumer_key, consumer_secret, cnpj_contador = get_common_credentials(payload)
