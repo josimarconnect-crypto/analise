@@ -66,6 +66,8 @@ DCTFWEB_ID_SISTEMA = os.getenv("DCTFWEB_ID_SISTEMA", "DCTFWEB")
 DCTFWEB_VERSAO = os.getenv("DCTFWEB_VERSAO", "1.0")
 MIT_ID_SISTEMA = os.getenv("MIT_ID_SISTEMA", "MIT")
 MIT_VERSAO = os.getenv("MIT_VERSAO", "1.0")
+EVENTOS_ID_SISTEMA = os.getenv("EVENTOS_ID_SISTEMA", "EVENTOSATUALIZACAO")
+EVENTOS_VERSAO = os.getenv("EVENTOS_VERSAO", "1.0")
 
 CND_TOKEN_URL = os.getenv("CND_TOKEN_URL", "https://gateway.apiserpro.serpro.gov.br/token").strip()
 CND_CERTIDAO_URL = os.getenv(
@@ -540,6 +542,31 @@ def body_mit_executar(
             "idSistema": id_sistema or MIT_ID_SISTEMA,
             "idServico": id_servico,
             "versaoSistema": versao_sistema or MIT_VERSAO,
+            "dados": encode_pedido_dados(dados),
+        },
+    }
+
+
+def body_eventos_executar(
+    cnpj_contador: str,
+    contribuinte_numero: str,
+    contribuinte_tipo: int,
+    id_servico: str,
+    dados: Any,
+    id_sistema: str = EVENTOS_ID_SISTEMA,
+    versao_sistema: str = EVENTOS_VERSAO,
+) -> Dict[str, Any]:
+    return {
+        "contratante": {"numero": cnpj_contador, "tipo": 2},
+        "autorPedidoDados": {"numero": cnpj_contador, "tipo": 2},
+        "contribuinte": {
+            "numero": str(contribuinte_numero or ""),
+            "tipo": int(contribuinte_tipo or 4),
+        },
+        "pedidoDados": {
+            "idSistema": id_sistema or EVENTOS_ID_SISTEMA,
+            "idServico": id_servico,
+            "versaoSistema": versao_sistema or EVENTOS_VERSAO,
             "dados": encode_pedido_dados(dados),
         },
     }
@@ -1753,6 +1780,62 @@ def executar_mit(
     return retorno
 
 
+def executar_eventos_atualizacao(
+    session: requests.Session,
+    cert: Tuple[str, str],
+    access_token: str,
+    jwt_token: str,
+    cnpj_contador: str,
+    contribuinte_numero: str,
+    contribuinte_tipo: int,
+    id_sistema: str,
+    id_servico: str,
+    versao_sistema: str,
+    dados: Any,
+) -> Dict[str, Any]:
+    body = body_eventos_executar(
+        cnpj_contador=cnpj_contador,
+        contribuinte_numero=contribuinte_numero,
+        contribuinte_tipo=contribuinte_tipo,
+        id_servico=id_servico,
+        dados=dados,
+        id_sistema=id_sistema,
+        versao_sistema=versao_sistema,
+    )
+    status, resposta = post_json(
+        session,
+        API_BASE.rstrip("/") + "/Monitorar",
+        headers(access_token, jwt_token),
+        body,
+        cert,
+    )
+    if status >= 400:
+        dados_parseados = resposta.get("dados_parseados")
+        mensagem = first_not_empty(resposta, "mensagem", "message", "erro", "error", "raw")
+        if not mensagem and isinstance(dados_parseados, dict):
+            mensagem = first_not_empty(dados_parseados, "mensagem", "message", "erro", "error")
+        raise PgdasdUpstreamError(
+            str(mensagem or "Falha ao executar EVENTOSATUALIZACAO."),
+            status=status,
+            resposta=resposta,
+            url=API_BASE.rstrip("/") + "/Monitorar",
+            body=body,
+        )
+
+    return {
+        "ok": True,
+        "servico": "eventosatualizacao_executar",
+        "idSistema": id_sistema,
+        "idServico": id_servico,
+        "versaoSistema": versao_sistema,
+        "contribuinte": {"numero": contribuinte_numero, "tipo": contribuinte_tipo},
+        "dados_enviados": try_json(body["pedidoDados"].get("dados")),
+        "retorno": resposta,
+        "dados": resposta.get("dados"),
+        "dados_parseados": resposta.get("dados_parseados"),
+    }
+
+
 def parse_bool_field(value: Any, default: bool = False) -> bool:
     if value in (None, ""):
         return default
@@ -2933,6 +3016,121 @@ def executar_mit_route():
                 pass
 
 
+@app.post("/integra-monitoramento/eventos/executar")
+@app.post("/integra-eventosatualizacao/executar")
+def executar_eventos_atualizacao_route():
+    payload = request.get_json(silent=True) or {}
+    consumer_key, consumer_secret, cnpj_contador = get_common_credentials(payload)
+    pedido_dados = payload.get("pedidoDados") if isinstance(payload.get("pedidoDados"), dict) else {}
+    id_sistema = str(payload.get("idSistema") or pedido_dados.get("idSistema") or EVENTOS_ID_SISTEMA).strip()
+    id_servico = str(payload.get("idServico") or pedido_dados.get("idServico") or "").strip()
+    versao_sistema = str(payload.get("versaoSistema") or pedido_dados.get("versaoSistema") or EVENTOS_VERSAO).strip()
+    dados = payload.get("dados")
+    if dados in (None, ""):
+        dados = pedido_dados.get("dados", "")
+
+    contribuinte_obj = payload.get("contribuinte") if isinstance(payload.get("contribuinte"), dict) else {}
+    contribuinte_tipo_raw = (
+        payload.get("contribuinte_tipo")
+        or payload.get("contribuinteTipo")
+        or contribuinte_obj.get("tipo")
+        or payload.get("tipo_contribuinte")
+        or payload.get("tipoContribuinte")
+        or 4
+    )
+    try:
+        contribuinte_tipo = int(contribuinte_tipo_raw)
+    except Exception:
+        contribuinte_tipo = 4
+    contribuinte_numero = str(
+        payload.get("contribuinte_numero")
+        or payload.get("contribuinteNumero")
+        or contribuinte_obj.get("numero")
+        or payload.get("contribuinte_cnpj")
+        or payload.get("cnpj")
+        or ""
+    ).strip()
+    numeros_lista = [digits(part) for part in contribuinte_numero.split(",") if digits(part)]
+
+    if len(cnpj_contador) != 14:
+        return jsonify({"ok": False, "erro": "Informe o CNPJ do contador com 14 digitos."}), 400
+    if not consumer_key or not consumer_secret:
+        return jsonify({"ok": False, "erro": "Informe consumer_key e consumer_secret."}), 400
+    if not id_servico:
+        return jsonify({"ok": False, "erro": "Informe idServico para executar o EVENTOSATUALIZACAO."}), 400
+    if id_sistema != EVENTOS_ID_SISTEMA:
+        return jsonify({"ok": False, "erro": "Esta rota aceita apenas idSistema EVENTOSATUALIZACAO."}), 400
+    if contribuinte_tipo not in (1, 2, 3, 4):
+        return jsonify({"ok": False, "erro": "contribuinte_tipo invalido. Use 1, 2, 3 ou 4."}), 400
+
+    solicitacao_ids = {"SOLICEVENTOSPF131", "SOLICEVENTOSPJ132"}
+    obtencao_ids = {"OBTEREVENTOSPF133", "OBTEREVENTOSPJ134"}
+    if contribuinte_tipo in (3, 4):
+        if id_servico in solicitacao_ids:
+            if not numeros_lista:
+                return jsonify({"ok": False, "erro": "Para solicitar eventos em lote informe contribuinte_numero com lista CSV de documentos."}), 400
+            max_len = 11 if contribuinte_tipo == 3 else 14
+            if any(len(n) != max_len for n in numeros_lista):
+                return jsonify({"ok": False, "erro": f"Todos os documentos da lista devem ter {max_len} digitos para contribuinte_tipo {contribuinte_tipo}."}), 400
+            if len(numeros_lista) > 1000:
+                return jsonify({"ok": False, "erro": "A lista de contribuintes suporta no maximo 1000 documentos."}), 400
+            contribuinte_numero = ",".join(numeros_lista)
+        elif id_servico in obtencao_ids:
+            # Para OBTER, o campo numero deve estar vazio conforme documentação.
+            contribuinte_numero = ""
+    else:
+        numero_unico = digits(contribuinte_numero)
+        if len(numero_unico) not in (11, 14):
+            return jsonify({"ok": False, "erro": "Informe contribuinte_numero valido para contribuinte_tipo 1/2."}), 400
+        contribuinte_numero = numero_unico
+
+    try:
+        pem_path, key_path = load_cert_paths(payload)
+    except Exception as exc:
+        return jsonify({"ok": False, "erro": f"Certificado invalido: {exc}"}), 400
+
+    try:
+        session = requests.Session()
+        cert = (pem_path, key_path)
+        auth = authenticate(session, consumer_key, consumer_secret, cert)
+        resultado = executar_eventos_atualizacao(
+            session=session,
+            cert=cert,
+            access_token=auth["access_token"],
+            jwt_token=auth["jwt_token"],
+            cnpj_contador=cnpj_contador,
+            contribuinte_numero=contribuinte_numero,
+            contribuinte_tipo=contribuinte_tipo,
+            id_sistema=id_sistema,
+            id_servico=id_servico,
+            versao_sistema=versao_sistema,
+            dados=dados,
+        )
+        resultado["tokens"] = {"expires_in": auth.get("expires_in")}
+        return jsonify(resultado)
+    except requests.HTTPError as exc:
+        detail = exc.response.text if exc.response is not None else str(exc)
+        return jsonify({"ok": False, "erro": detail}), 400
+    except PgdasdUpstreamError as exc:
+        pedido_dados_enviado = (exc.body or {}).get("pedidoDados", {})
+        return jsonify({
+            "ok": False,
+            "erro": str(exc),
+            "status_serpro": exc.status,
+            "endpoint_serpro": exc.url,
+            "retorno_serpro": exc.resposta,
+            "pedidoDados": pedido_dados_enviado,
+        }), 502
+    except Exception as exc:
+        return jsonify({"ok": False, "erro": str(exc)}), 500
+    finally:
+        for path in (pem_path, key_path):
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+
 @app.get("/health")
 def health():
     return jsonify({
@@ -2957,6 +3155,7 @@ def health():
             "/integra-pagtoweb/pagamentos/executar",
             "/integra-dctfweb/dctfweb/executar",
             "/integra-mit/mit/executar",
+            "/integra-monitoramento/eventos/executar",
         ],
     })
 
