@@ -61,6 +61,8 @@ PROCURACOES_ID_SERVICO_OBTER = os.getenv("PROCURACOES_ID_SERVICO_OBTER", "OBTERP
 PROCURACOES_VERSAO = os.getenv("PROCURACOES_VERSAO", "1")
 PAGTOWEB_ID_SISTEMA = os.getenv("PAGTOWEB_ID_SISTEMA", "PAGTOWEB")
 PAGTOWEB_VERSAO = os.getenv("PAGTOWEB_VERSAO", "1.0")
+DCTFWEB_ID_SISTEMA = os.getenv("DCTFWEB_ID_SISTEMA", "DCTFWEB")
+DCTFWEB_VERSAO = os.getenv("DCTFWEB_VERSAO", "1.0")
 
 CND_TOKEN_URL = os.getenv("CND_TOKEN_URL", "https://gateway.apiserpro.serpro.gov.br/token").strip()
 CND_CERTIDAO_URL = os.getenv(
@@ -347,6 +349,27 @@ def body_pagtoweb_executar(
             "idSistema": id_sistema or PAGTOWEB_ID_SISTEMA,
             "idServico": id_servico,
             "versaoSistema": versao_sistema or PAGTOWEB_VERSAO,
+            "dados": encode_pedido_dados(dados),
+        },
+    }
+
+
+def body_dctfweb_executar(
+    cnpj_contador: str,
+    cnpj_contribuinte: str,
+    id_servico: str,
+    dados: Any,
+    id_sistema: str = DCTFWEB_ID_SISTEMA,
+    versao_sistema: str = DCTFWEB_VERSAO,
+) -> Dict[str, Any]:
+    return {
+        "contratante": {"numero": cnpj_contador, "tipo": 2},
+        "autorPedidoDados": {"numero": cnpj_contador, "tipo": 2},
+        "contribuinte": {"numero": cnpj_contribuinte, "tipo": infer_document_type(cnpj_contribuinte)},
+        "pedidoDados": {
+            "idSistema": id_sistema or DCTFWEB_ID_SISTEMA,
+            "idServico": id_servico,
+            "versaoSistema": versao_sistema or DCTFWEB_VERSAO,
             "dados": encode_pedido_dados(dados),
         },
     }
@@ -1418,6 +1441,75 @@ def executar_pagtoweb(
     }
 
 
+def executar_dctfweb(
+    session: requests.Session,
+    cert: Tuple[str, str],
+    access_token: str,
+    jwt_token: str,
+    cnpj_contador: str,
+    cnpj_contribuinte: str,
+    endpoint: str,
+    id_sistema: str,
+    id_servico: str,
+    versao_sistema: str,
+    dados: Any,
+) -> Dict[str, Any]:
+    endpoint_key = str(endpoint or "Consultar").strip().lower()
+    url_map = {
+        "consultar": URL_INTEGRA_CONSULTAR,
+        "consulta": URL_INTEGRA_CONSULTAR,
+        "emitir": URL_INTEGRA_EMITIR,
+        "emissao": URL_INTEGRA_EMITIR,
+        "declarar": URL_INTEGRA_DECLARAR,
+        "declaracao": URL_INTEGRA_DECLARAR,
+    }
+    url = url_map.get(endpoint_key)
+    if not url:
+        raise ValueError("Endpoint DCTFWEB invalido. Use Consultar, Emitir ou Declarar.")
+
+    body = body_dctfweb_executar(
+        cnpj_contador=cnpj_contador,
+        cnpj_contribuinte=cnpj_contribuinte,
+        id_servico=id_servico,
+        dados=dados,
+        id_sistema=id_sistema,
+        versao_sistema=versao_sistema,
+    )
+    status, resposta = post_json(
+        session,
+        url,
+        headers(access_token, jwt_token),
+        body,
+        cert,
+    )
+    if status >= 400:
+        dados_parseados = resposta.get("dados_parseados")
+        mensagem = first_not_empty(resposta, "mensagem", "message", "erro", "error", "raw")
+        if not mensagem and isinstance(dados_parseados, dict):
+            mensagem = first_not_empty(dados_parseados, "mensagem", "message", "erro", "error")
+        raise PgdasdUpstreamError(
+            str(mensagem or "Falha ao executar DCTFWEB."),
+            status=status,
+            resposta=resposta,
+            url=url,
+            body=body,
+        )
+
+    return {
+        "ok": True,
+        "servico": "dctfweb_executar",
+        "cnpj": cnpj_contribuinte,
+        "endpoint": endpoint_key,
+        "idSistema": id_sistema,
+        "idServico": id_servico,
+        "versaoSistema": versao_sistema,
+        "dados_enviados": try_json(body["pedidoDados"].get("dados")),
+        "retorno": resposta,
+        "dados": resposta.get("dados"),
+        "dados_parseados": resposta.get("dados_parseados"),
+    }
+
+
 def parse_bool_field(value: Any, default: bool = False) -> bool:
     if value in (None, ""):
         return default
@@ -2452,6 +2544,78 @@ def executar_pagtoweb_route():
                 pass
 
 
+@app.post("/integra-dctfweb/dctfweb/executar")
+def executar_dctfweb_route():
+    payload = request.get_json(silent=True) or {}
+    consumer_key, consumer_secret, cnpj_contador = get_common_credentials(payload)
+    contribuinte_cnpj = digits(payload.get("contribuinte_cnpj") or payload.get("cnpj"))
+    pedido_dados = payload.get("pedidoDados") if isinstance(payload.get("pedidoDados"), dict) else {}
+    endpoint = str(payload.get("endpoint") or "Consultar").strip()
+    id_sistema = str(payload.get("idSistema") or pedido_dados.get("idSistema") or DCTFWEB_ID_SISTEMA).strip()
+    id_servico = str(payload.get("idServico") or pedido_dados.get("idServico") or "").strip()
+    versao_sistema = str(payload.get("versaoSistema") or pedido_dados.get("versaoSistema") or DCTFWEB_VERSAO).strip()
+    dados = payload.get("dados")
+    if dados in (None, ""):
+        dados = pedido_dados.get("dados", "")
+
+    if len(cnpj_contador) != 14:
+        return jsonify({"ok": False, "erro": "Informe o CNPJ do contador com 14 digitos."}), 400
+    if len(contribuinte_cnpj) not in (11, 14):
+        return jsonify({"ok": False, "erro": "Informe o CPF/CNPJ do contribuinte com 11 ou 14 digitos."}), 400
+    if not consumer_key or not consumer_secret:
+        return jsonify({"ok": False, "erro": "Informe consumer_key e consumer_secret."}), 400
+    if not id_servico:
+        return jsonify({"ok": False, "erro": "Informe idServico para executar o DCTFWEB."}), 400
+    if id_sistema != DCTFWEB_ID_SISTEMA:
+        return jsonify({"ok": False, "erro": "Esta rota aceita apenas idSistema DCTFWEB."}), 400
+
+    try:
+        pem_path, key_path = load_cert_paths(payload)
+    except Exception as exc:
+        return jsonify({"ok": False, "erro": f"Certificado invalido: {exc}"}), 400
+
+    try:
+        session = requests.Session()
+        cert = (pem_path, key_path)
+        auth = authenticate(session, consumer_key, consumer_secret, cert)
+        resultado = executar_dctfweb(
+            session=session,
+            cert=cert,
+            access_token=auth["access_token"],
+            jwt_token=auth["jwt_token"],
+            cnpj_contador=cnpj_contador,
+            cnpj_contribuinte=contribuinte_cnpj,
+            endpoint=endpoint,
+            id_sistema=id_sistema,
+            id_servico=id_servico,
+            versao_sistema=versao_sistema,
+            dados=dados,
+        )
+        resultado["tokens"] = {"expires_in": auth.get("expires_in")}
+        return jsonify(resultado)
+    except requests.HTTPError as exc:
+        detail = exc.response.text if exc.response is not None else str(exc)
+        return jsonify({"ok": False, "erro": detail}), 400
+    except PgdasdUpstreamError as exc:
+        pedido_dados_enviado = (exc.body or {}).get("pedidoDados", {})
+        return jsonify({
+            "ok": False,
+            "erro": str(exc),
+            "status_serpro": exc.status,
+            "endpoint_serpro": exc.url,
+            "retorno_serpro": exc.resposta,
+            "pedidoDados": pedido_dados_enviado,
+        }), 502
+    except Exception as exc:
+        return jsonify({"ok": False, "erro": str(exc)}), 500
+    finally:
+        for path in (pem_path, key_path):
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+
 @app.get("/health")
 def health():
     return jsonify({
@@ -2474,6 +2638,7 @@ def health():
             "/integra-sn/pgdasd/executar",
             "/integra-procuracoes/procuracoes/consultar",
             "/integra-pagtoweb/pagamentos/executar",
+            "/integra-dctfweb/dctfweb/executar",
         ],
     })
 
