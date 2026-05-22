@@ -154,6 +154,152 @@ def first_not_empty(mapping: Dict[str, Any], *keys: str) -> Any:
     return None
 
 
+def _normalize_text(value: Any) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _iter_nodes(root: Any):
+    queue: List[Any] = [try_json(root)]
+    seen: set = set()
+    while queue:
+        node = queue.pop(0)
+        if node is None:
+            continue
+        if isinstance(node, (str, int, float, bool)):
+            yield node
+            continue
+        if isinstance(node, list):
+            for item in node:
+                queue.append(try_json(item))
+            continue
+        if not isinstance(node, dict):
+            continue
+        marker = id(node)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        yield node
+        for value in node.values():
+            queue.append(try_json(value))
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    if value in (None, "", [], {}):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    text = text.replace(".", "").replace(",", ".")
+    try:
+        return float(text)
+    except Exception:
+        return None
+
+
+def _pick_first_value(payload: Any, keys: List[str]) -> Any:
+    wanted = {re.sub(r"[^a-z0-9]+", "", k.lower()) for k in keys}
+    for node in _iter_nodes(payload):
+        if not isinstance(node, dict):
+            continue
+        for k, v in node.items():
+            nk = re.sub(r"[^a-z0-9]+", "", str(k).lower())
+            if nk in wanted and v not in (None, "", [], {}):
+                return v
+    return None
+
+
+def _pick_first_list(payload: Any, keys: List[str]) -> List[Any]:
+    wanted = {re.sub(r"[^a-z0-9]+", "", k.lower()) for k in keys}
+    for node in _iter_nodes(payload):
+        if not isinstance(node, dict):
+            continue
+        for k, v in node.items():
+            nk = re.sub(r"[^a-z0-9]+", "", str(k).lower())
+            if nk in wanted and isinstance(v, list):
+                return v
+    return []
+
+
+def _mit_status_label(raw: Any) -> str:
+    text = _normalize_text(raw)
+    norm = re.sub(r"[^a-z0-9]+", "", text.lower())
+    mapa = {
+        "0": "Não Entregue",
+        "1": "Entregues",
+        "2": "Encerrado",
+        "3": "Em edição",
+        "4": "Não Obrigado",
+    }
+    if text in mapa:
+        return mapa[text]
+    if norm in mapa:
+        return mapa[norm]
+    if "naoobrig" in norm:
+        return "Não Obrigado"
+    if "edicao" in norm or "andamento" in norm:
+        return "Em edição"
+    if "encerr" in norm:
+        return "Encerrado"
+    if "entreg" in norm or "transmit" in norm:
+        return "Entregues"
+    if "naoentreg" in norm:
+        return "Não Entregue"
+    return text or "Não Entregue"
+
+
+def normalize_mit_response(payload: Any) -> Dict[str, Any]:
+    data = try_json(payload)
+    detalhes = try_json(first_not_empty(data if isinstance(data, dict) else {}, "dados_parseados", "dados")) if isinstance(data, dict) else None
+    source = detalhes if detalhes not in (None, "", [], {}) else data
+
+    apuracoes = _pick_first_list(source, [
+        "listaApuracoes",
+        "apuracoes",
+        "listaApuracao",
+        "listaApuracoesMesAno",
+        "listaApuracoesPorPeriodo",
+    ])
+    ap_item = apuracoes[0] if apuracoes else None
+    if not isinstance(ap_item, dict):
+        ap_item = source if isinstance(source, dict) else {}
+
+    status_raw = (
+        _pick_first_value(ap_item, ["situacaoApuracao", "statusApuracao", "situacao", "status"])
+        or _pick_first_value(source, ["situacaoApuracao", "statusApuracao", "situacao", "status"])
+    )
+    data_enc = (
+        _pick_first_value(ap_item, ["dataEncerramento", "dataHoraEncerramento", "dataEncerramentoApuracao"])
+        or _pick_first_value(source, ["dataEncerramento", "dataHoraEncerramento", "dataEncerramentoApuracao"])
+    )
+    valor = (
+        _pick_first_value(ap_item, ["valorApurado", "valorTotalApurado", "valorTotal", "totalApurado"])
+        or _pick_first_value(source, ["valorApurado", "valorTotalApurado", "valorTotal", "totalApurado"])
+    )
+    id_apuracao = (
+        _pick_first_value(ap_item, ["idApuracao", "idapuracao"])
+        or _pick_first_value(source, ["idApuracao", "idapuracao"])
+    )
+    protocolo = (
+        _pick_first_value(ap_item, ["protocoloEncerramento", "protocolo"])
+        or _pick_first_value(source, ["protocoloEncerramento", "protocolo"])
+    )
+
+    return {
+        "status": _mit_status_label(status_raw),
+        "status_raw": _normalize_text(status_raw),
+        "data_encerramento": _normalize_text(data_enc),
+        "valor_apurado": _safe_float(valor) if _safe_float(valor) is not None else 0.0,
+        "id_apuracao": _normalize_text(id_apuracao),
+        "protocolo_encerramento": _normalize_text(protocolo),
+        "apuracoes": apuracoes if isinstance(apuracoes, list) else [],
+        "detalhes": source if isinstance(source, (dict, list)) else {},
+    }
+
+
 def authenticate(session: requests.Session, consumer_key: str, consumer_secret: str, cert: Tuple[str, str]) -> Dict[str, Any]:
     basic = base64.b64encode(f"{consumer_key}:{consumer_secret}".encode("utf-8")).decode("utf-8")
     resp = session.post(
@@ -1590,7 +1736,7 @@ def executar_mit(
             body=body,
         )
 
-    return {
+    retorno = {
         "ok": True,
         "servico": "mit_executar",
         "cnpj": cnpj_contribuinte,
@@ -1603,6 +1749,8 @@ def executar_mit(
         "dados": resposta.get("dados"),
         "dados_parseados": resposta.get("dados_parseados"),
     }
+    retorno["mit_normalizado"] = normalize_mit_response(retorno)
+    return retorno
 
 
 def parse_bool_field(value: Any, default: bool = False) -> bool:
