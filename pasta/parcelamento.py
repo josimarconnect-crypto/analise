@@ -1,4 +1,5 @@
 import base64
+import html
 import json
 import os
 import re
@@ -2084,6 +2085,30 @@ def _extract_nome_from_html(raw_html: str) -> str:
     return ""
 
 
+def _extract_nome_from_html_v2(raw_html: str) -> str:
+    text = html.unescape(str(raw_html or ""))
+    if not text:
+        return ""
+    patterns = [
+        r'(?is)<span[^>]*class=["\'][^"\']*\bdados\b[^"\']*\bnome\b[^"\']*["\'][^>]*>\s*([^<\n\r]{3,})\s*</span>',
+        r"(?is)Raz[aã]o\s*Social\s*</[^>]+>\s*([^<\n\r]{3,})",
+        r"(?is)Nome\s*Empresarial\s*</[^>]+>\s*([^<\n\r]{3,})",
+        r"(?is)Nome\s*do\s*Contribuinte\s*</[^>]+>\s*([^<\n\r]{3,})",
+        r"(?is)Nome\s*:\s*([^<\n\r]{3,})",
+        r"(?is)<title>\s*([^<]{3,}?)\s*-\s*(?:CPF|CNPJ)\s*:",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        nome = re.sub(r"<[^>]+>", " ", str(match.group(1) or ""))
+        nome = _normalize_text(html.unescape(nome))
+        nome = re.sub(r"\s+-\s*$", "", nome).strip()
+        if nome and len(nome) >= 3:
+            return nome
+    return ""
+
+
 def _extract_nome_from_payload(payload: Any, raw_text: str = "") -> str:
     nome_keys = [
         "nome",
@@ -2099,6 +2124,9 @@ def _extract_nome_from_payload(payload: Any, raw_text: str = "") -> str:
     nome = _normalize_text(picked)
     if nome and len(nome) >= 3:
         return nome
+    nome_html = _extract_nome_from_html_v2(raw_text)
+    if nome_html and len(nome_html) >= 3:
+        return nome_html
     return _extract_nome_from_html(raw_text)
 
 
@@ -2173,6 +2201,39 @@ def consultar_nome_sem_certificado(
                     mensagens.append(str(value))
         erro = " / ".join(mensagens).strip() or "Nome não encontrado no retorno."
         out["erro"] = erro
+    return out
+
+
+def consultar_nome_sem_certificado_publico(
+    session: requests.Session,
+    documento: str,
+    timeout: int = 30,
+) -> Dict[str, Any]:
+    doc = digits(documento)
+    if len(doc) not in (11, 14):
+        return {"ok": False, "erro": "Documento invalido.", "documento": doc}
+
+    url = f"https://www.situacao-cadastral.com/empresa/{doc}.html"
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    }
+    response = session.get(url, headers=headers, timeout=timeout, verify=VERIFY_SSL)
+    raw_text = response.text or ""
+    nome = _extract_nome_from_html_v2(raw_text)
+    if not nome:
+        nome = _extract_nome_from_html(raw_text)
+
+    out = {
+        "ok": response.status_code < 400 and bool(nome),
+        "status_http": response.status_code,
+        "documento": doc,
+        "nome": nome,
+        "fonte": "situacao-cadastral-publica",
+        "url_consultada": url,
+    }
+    if not out["ok"]:
+        out["erro"] = f"Nome nao encontrado para o documento informado. HTTP {response.status_code}."
     return out
 
 
@@ -3434,11 +3495,6 @@ def buscar_nome_sem_certificado_route():
         return jsonify({"ok": False, "erro": "Informe CPF/CNPJ com 11 ou 14 digitos."}), 400
 
     lookup_url = str(payload.get("lookup_url") or SITCAD_LOOKUP_URL).strip()
-    if not lookup_url:
-        return jsonify({
-            "ok": False,
-            "erro": "Endpoint de busca não configurado. Defina SITCAD_LOOKUP_URL no backend.",
-        }), 501
 
     method = str(payload.get("method") or SITCAD_LOOKUP_METHOD).strip().upper() or "POST"
     doc_field = str(payload.get("doc_field") or SITCAD_LOOKUP_DOC_FIELD).strip() or "documento"
@@ -3453,16 +3509,23 @@ def buscar_nome_sem_certificado_route():
 
     try:
         session = requests.Session()
-        resultado = consultar_nome_sem_certificado(
-            session=session,
-            documento=documento,
-            lookup_url=lookup_url,
-            method=method,
-            doc_field=doc_field,
-            timeout=timeout,
-            token_header=token_header,
-            token_value=token_value,
-        )
+        if lookup_url:
+            resultado = consultar_nome_sem_certificado(
+                session=session,
+                documento=documento,
+                lookup_url=lookup_url,
+                method=method,
+                doc_field=doc_field,
+                timeout=timeout,
+                token_header=token_header,
+                token_value=token_value,
+            )
+        else:
+            resultado = consultar_nome_sem_certificado_publico(
+                session=session,
+                documento=documento,
+                timeout=timeout,
+            )
         if resultado.get("ok"):
             return jsonify(resultado)
 
