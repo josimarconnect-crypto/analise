@@ -23,6 +23,7 @@ from flask import Flask, jsonify
 from starlette.middleware.wsgi import WSGIMiddleware
 
 try:
+    # Inclui rotas de integra-contador e apoio de cadastro sem certificado.
     from parcelamento import app as parcelamento_app  # type: ignore
 except Exception:
     parcelamento_app = None

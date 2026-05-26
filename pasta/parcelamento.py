@@ -71,6 +71,12 @@ EPROCESSO_ID_SERVICO_CONSULTAR = os.getenv("EPROCESSO_ID_SERVICO_CONSULTAR", "CO
 EPROCESSO_VERSAO = os.getenv("EPROCESSO_VERSAO", "2.0")
 EVENTOS_ID_SISTEMA = os.getenv("EVENTOS_ID_SISTEMA", "EVENTOSATUALIZACAO")
 EVENTOS_VERSAO = os.getenv("EVENTOS_VERSAO", "1.0")
+SITCAD_LOOKUP_URL = os.getenv("SITCAD_LOOKUP_URL", "").strip()
+SITCAD_LOOKUP_METHOD = os.getenv("SITCAD_LOOKUP_METHOD", "POST").strip().upper() or "POST"
+SITCAD_LOOKUP_TIMEOUT = int(os.getenv("SITCAD_LOOKUP_TIMEOUT", "30"))
+SITCAD_LOOKUP_DOC_FIELD = os.getenv("SITCAD_LOOKUP_DOC_FIELD", "documento").strip() or "documento"
+SITCAD_LOOKUP_TOKEN_HEADER = os.getenv("SITCAD_LOOKUP_TOKEN_HEADER", "X-API-Key").strip() or "X-API-Key"
+SITCAD_LOOKUP_TOKEN = os.getenv("SITCAD_LOOKUP_TOKEN", "").strip()
 
 CND_TOKEN_URL = os.getenv("CND_TOKEN_URL", "https://gateway.apiserpro.serpro.gov.br/token").strip()
 CND_CERTIDAO_URL = os.getenv(
@@ -2058,6 +2064,118 @@ def read_cnd_consolidado(user: str, file_name: str = "consolidado.json") -> Dict
     return content
 
 
+def _extract_nome_from_html(raw_html: str) -> str:
+    text = str(raw_html or "")
+    if not text:
+        return ""
+    patterns = [
+        r"(?is)Raz[aã]o\s*Social\s*</[^>]+>\s*([^<\n\r]{3,})",
+        r"(?is)Nome\s*Empresarial\s*</[^>]+>\s*([^<\n\r]{3,})",
+        r"(?is)Nome\s*do\s*Contribuinte\s*</[^>]+>\s*([^<\n\r]{3,})",
+        r"(?is)Nome\s*:\s*([^<\n\r]{3,})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        nome = _normalize_text(match.group(1))
+        if nome and len(nome) >= 3:
+            return nome
+    return ""
+
+
+def _extract_nome_from_payload(payload: Any, raw_text: str = "") -> str:
+    nome_keys = [
+        "nome",
+        "nomeEmpresarial",
+        "nomeRazaoSocial",
+        "razaoSocial",
+        "razao",
+        "nomeContribuinte",
+        "titular",
+        "name",
+    ]
+    picked = _pick_first_value(payload, nome_keys)
+    nome = _normalize_text(picked)
+    if nome and len(nome) >= 3:
+        return nome
+    return _extract_nome_from_html(raw_text)
+
+
+def consultar_nome_sem_certificado(
+    session: requests.Session,
+    documento: str,
+    lookup_url: str,
+    method: str = "POST",
+    doc_field: str = "documento",
+    timeout: int = 30,
+    token_header: str = "X-API-Key",
+    token_value: str = "",
+) -> Dict[str, Any]:
+    url = str(lookup_url or "").strip()
+    if not url:
+        raise ValueError("Endpoint de busca não configurado.")
+
+    method_norm = str(method or "POST").strip().upper()
+    if method_norm not in ("POST", "GET"):
+        method_norm = "POST"
+
+    field = str(doc_field or "documento").strip() or "documento"
+    headers = {
+        "Accept": "application/json, text/html;q=0.9,*/*;q=0.8",
+        "User-Agent": "ComunidadeFiscal-SemCert/1.0",
+    }
+    if token_value:
+        headers[str(token_header or "X-API-Key").strip() or "X-API-Key"] = token_value
+
+    payload_json = {
+        field: documento,
+        "documento": documento,
+        "doc": documento,
+        "cnpj_cpf": documento,
+        "cpf_cnpj": documento,
+    }
+    if method_norm == "GET":
+        response = session.get(url, params=payload_json, headers=headers, timeout=timeout, verify=VERIFY_SSL)
+    else:
+        headers["Content-Type"] = "application/json"
+        response = session.post(url, json=payload_json, headers=headers, timeout=timeout, verify=VERIFY_SSL)
+
+    raw_text = response.text or ""
+    content_type = (response.headers.get("content-type") or "").lower()
+
+    parsed: Any = {}
+    if "application/json" in content_type:
+        try:
+            parsed = response.json()
+        except Exception:
+            parsed = {"raw": raw_text}
+    else:
+        try:
+            parsed = response.json()
+        except Exception:
+            parsed = {"raw": raw_text}
+
+    nome = _extract_nome_from_payload(parsed, raw_text=raw_text)
+    out = {
+        "ok": response.status_code < 400 and bool(nome),
+        "status_http": response.status_code,
+        "documento": documento,
+        "nome": nome,
+        "retorno": parsed,
+    }
+    if not out["ok"]:
+        mensagens = []
+        if isinstance(parsed, dict):
+            for key in ("erro", "error", "mensagem", "message", "detail"):
+                value = parsed.get(key)
+                if value not in (None, "", [], {}):
+                    mensagens.append(str(value))
+        erro = " / ".join(mensagens).strip() or "Nome não encontrado no retorno."
+        out["erro"] = erro
+    return out
+
+
 def get_common_credentials(payload: Dict[str, Any]) -> Tuple[str, str, str]:
     consumer_key = str(payload.get("consumer_key") or "").strip()
     consumer_secret = str(payload.get("consumer_secret") or "").strip()
@@ -3298,6 +3416,67 @@ def executar_eventos_atualizacao_route():
                 pass
 
 
+@app.post("/integra-cadastro/sem-certificado/buscar-nome")
+@app.post("/integra-cadastro/sem-cert/buscar-nome")
+def buscar_nome_sem_certificado_route():
+    payload = request.get_json(silent=True) or {}
+    documento = digits(
+        payload.get("documento")
+        or payload.get("cnpj_cpf")
+        or payload.get("cpf_cnpj")
+        or payload.get("doc")
+        or ""
+    )
+    if len(documento) not in (11, 14):
+        return jsonify({"ok": False, "erro": "Informe CPF/CNPJ com 11 ou 14 digitos."}), 400
+
+    lookup_url = str(payload.get("lookup_url") or SITCAD_LOOKUP_URL).strip()
+    if not lookup_url:
+        return jsonify({
+            "ok": False,
+            "erro": "Endpoint de busca não configurado. Defina SITCAD_LOOKUP_URL no backend.",
+        }), 501
+
+    method = str(payload.get("method") or SITCAD_LOOKUP_METHOD).strip().upper() or "POST"
+    doc_field = str(payload.get("doc_field") or SITCAD_LOOKUP_DOC_FIELD).strip() or "documento"
+    token_header = str(payload.get("token_header") or SITCAD_LOOKUP_TOKEN_HEADER).strip() or "X-API-Key"
+    token_value = str(payload.get("token") or SITCAD_LOOKUP_TOKEN).strip()
+
+    timeout_raw = payload.get("timeout", SITCAD_LOOKUP_TIMEOUT)
+    try:
+        timeout = max(5, int(str(timeout_raw).strip()))
+    except Exception:
+        timeout = SITCAD_LOOKUP_TIMEOUT
+
+    try:
+        session = requests.Session()
+        resultado = consultar_nome_sem_certificado(
+            session=session,
+            documento=documento,
+            lookup_url=lookup_url,
+            method=method,
+            doc_field=doc_field,
+            timeout=timeout,
+            token_header=token_header,
+            token_value=token_value,
+        )
+        if resultado.get("ok"):
+            return jsonify(resultado)
+
+        status_http = int(resultado.get("status_http") or 404)
+        if status_http < 400:
+            status_http = 404
+        return jsonify(resultado), status_http
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "erro": f"Falha ao consultar endpoint externo de cadastro: {exc}",
+            "documento": documento,
+        }), 502
+    except Exception as exc:
+        return jsonify({"ok": False, "erro": str(exc), "documento": documento}), 500
+
+
 @app.get("/health")
 def health():
     return jsonify({
@@ -3325,6 +3504,7 @@ def health():
             "/integra-eprocesso/eprocesso/executar",
             "/integra-eprocesso/processos/consultar",
             "/integra-monitoramento/eventos/executar",
+            "/integra-cadastro/sem-certificado/buscar-nome",
         ],
     })
 
