@@ -3418,6 +3418,9 @@ def executar_eventos_atualizacao_route():
 
 @app.post("/integra-cadastro/sem-certificado/buscar-nome")
 @app.post("/integra-cadastro/sem-cert/buscar-nome")
+@app.post("/integra-cadastro/buscar-nome")
+@app.post("/cadastro/sem-certificado/buscar-nome")
+@app.post("/cadastro/sem-cert/buscar-nome")
 def buscar_nome_sem_certificado_route():
     payload = request.get_json(silent=True) or {}
     documento = digits(
