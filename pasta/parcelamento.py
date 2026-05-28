@@ -1103,6 +1103,7 @@ def consultar_um_cnpj(
     cnpj_contador: str,
     cnpj_contribuinte: str,
     procurador_token: str,
+    return_pdf_base64: bool = True,
 ) -> Dict[str, Any]:
     hdrs = headers(access_token, jwt_token, procurador_token)
     status, apoiar = post_json(
@@ -1163,7 +1164,7 @@ def consultar_um_cnpj(
 
     estruturado = parse_sitfis_estruturado(pdf_b64)
     cnpj_pdf = digits(estruturado.get("cnpj") or "")
-    return {
+    retorno = {
         # Mantem o CNPJ consultado como chave canônica do retorno do lote.
         # Isso evita colapsar múltiplos resultados quando o parser do PDF
         # extrai o mesmo documento para entradas diferentes.
@@ -1175,6 +1176,9 @@ def consultar_um_cnpj(
         "debitos": estruturado.get("debitos") or [],
         "processos": estruturado.get("processos") or [],
     }
+    if return_pdf_base64:
+        retorno["pdf_base64"] = str(pdf_b64 or "")
+    return retorno
 
 
 def consultar_um_cnpj_safe(
@@ -1184,6 +1188,7 @@ def consultar_um_cnpj_safe(
     cnpj_contador: str,
     cnpj_contribuinte: str,
     procurador_token: str,
+    return_pdf_base64: bool = True,
 ) -> Dict[str, Any]:
     try:
         with requests.Session() as session:
@@ -1195,6 +1200,7 @@ def consultar_um_cnpj_safe(
                 cnpj_contador=cnpj_contador,
                 cnpj_contribuinte=cnpj_contribuinte,
                 procurador_token=procurador_token,
+                return_pdf_base64=return_pdf_base64,
             )
     except Exception as item_exc:
         return {
@@ -2284,6 +2290,7 @@ def consultar_situacao():
     cnpj_contador = digits(payload.get("contratante_cnpj") or payload.get("autor_cnpj") or payload.get("cnpj_contador"))
     cnpjs = payload.get("cnpjs") or payload.get("contribuintes") or payload.get("lista_cnpj") or []
     procurador_token = str(payload.get("procurador_token") or "").strip()
+    return_pdf_base64 = parse_bool_field(payload.get("return_pdf_base64"), default=True)
     max_workers_raw = payload.get("max_workers", os.getenv("SITFIS_MAX_WORKERS", "2"))
 
     if isinstance(cnpjs, str):
@@ -2327,6 +2334,7 @@ def consultar_situacao():
                         cnpj_contador=cnpj_contador,
                         cnpj_contribuinte=cnpj,
                         procurador_token=procurador_token,
+                        return_pdf_base64=return_pdf_base64,
                     )
                 )
         else:
@@ -2341,6 +2349,7 @@ def consultar_situacao():
                         cnpj_contador,
                         cnpj,
                         procurador_token,
+                        return_pdf_base64,
                     ): idx
                     for idx, cnpj in enumerate(cnpjs)
                 }
