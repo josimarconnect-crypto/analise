@@ -45,7 +45,11 @@ VERSAO_APOIAR = os.getenv("SERPRO_VERSAO_APOIAR", "2.0")
 VERSAO_EMITIR = os.getenv("SERPRO_VERSAO_EMITIR", "2.0")
 
 PARCELAMENTO_ID_SISTEMA = os.getenv("PARCELAMENTO_ID_SISTEMA", "PARCSN")
-PARCELAMENTO_ID_SERVICO_CONSULTAR = os.getenv("PARCELAMENTO_ID_SERVICO_CONSULTAR", "PEDIDOSPARC163")
+PARCELAMENTO_ID_SERVICO_PEDIDOS = os.getenv("PARCELAMENTO_ID_SERVICO_PEDIDOS", "PEDIDOSPARC163")
+PARCELAMENTO_ID_SERVICO_CONSULTAR = os.getenv("PARCELAMENTO_ID_SERVICO_CONSULTAR", PARCELAMENTO_ID_SERVICO_PEDIDOS)
+PARCELAMENTO_ID_SERVICO_OBTER = os.getenv("PARCELAMENTO_ID_SERVICO_OBTER", "OBTERPARC164")
+PARCELAMENTO_ID_SERVICO_DETALHE_PAGAMENTO = os.getenv("PARCELAMENTO_ID_SERVICO_DETALHE_PAGAMENTO", "DETPAGTOPARC165")
+PARCELAMENTO_ID_SERVICO_PARCELAS_IMPRESSAO = os.getenv("PARCELAMENTO_ID_SERVICO_PARCELAS_IMPRESSAO", "PARCELASPARAGERAR162")
 PARCELAMENTO_ID_SERVICO_EMITIR = os.getenv("PARCELAMENTO_ID_SERVICO_EMITIR", "GERARDAS161")
 PARCELAMENTO_VERSAO = os.getenv("PARCELAMENTO_VERSAO", "1.0")
 
@@ -345,32 +349,87 @@ def headers(access_token: str, jwt_token: str, procurador_token: str = "") -> Di
     return out
 
 
-def body_parcelamento_consultar(cnpj_contador: str, cnpj_contribuinte: str) -> Dict[str, Any]:
+def body_parcelamento_servico(
+    cnpj_contador: str,
+    cnpj_contribuinte: str,
+    id_servico: str,
+    dados: Any = "",
+) -> Dict[str, Any]:
+    if isinstance(dados, (dict, list)):
+        dados_text = json.dumps(dados, ensure_ascii=False)
+    elif dados in (None, ""):
+        dados_text = ""
+    else:
+        dados_text = str(dados)
+
     return {
         "contratante": {"numero": cnpj_contador, "tipo": 2},
         "autorPedidoDados": {"numero": cnpj_contador, "tipo": 2},
         "contribuinte": {"numero": cnpj_contribuinte, "tipo": infer_document_type(cnpj_contribuinte)},
         "pedidoDados": {
             "idSistema": PARCELAMENTO_ID_SISTEMA,
-            "idServico": PARCELAMENTO_ID_SERVICO_CONSULTAR,
+            "idServico": id_servico,
             "versaoSistema": PARCELAMENTO_VERSAO,
-            "dados": "",
+            "dados": dados_text,
         },
     }
+
+
+def body_parcelamento_consultar(cnpj_contador: str, cnpj_contribuinte: str) -> Dict[str, Any]:
+    return body_parcelamento_servico(
+        cnpj_contador,
+        cnpj_contribuinte,
+        PARCELAMENTO_ID_SERVICO_PEDIDOS,
+        "",
+    )
+
+
+def body_parcelamento_obter(
+    cnpj_contador: str,
+    cnpj_contribuinte: str,
+    numero_parcelamento: int,
+) -> Dict[str, Any]:
+    return body_parcelamento_servico(
+        cnpj_contador,
+        cnpj_contribuinte,
+        PARCELAMENTO_ID_SERVICO_OBTER,
+        {"numeroParcelamento": int(numero_parcelamento)},
+    )
+
+
+def body_parcelamento_detalhe_pagamento(
+    cnpj_contador: str,
+    cnpj_contribuinte: str,
+    numero_parcelamento: int,
+    ano_mes_parcela: int,
+) -> Dict[str, Any]:
+    return body_parcelamento_servico(
+        cnpj_contador,
+        cnpj_contribuinte,
+        PARCELAMENTO_ID_SERVICO_DETALHE_PAGAMENTO,
+        {
+            "numeroParcelamento": int(numero_parcelamento),
+            "anoMesParcela": int(ano_mes_parcela),
+        },
+    )
+
+
+def body_parcelamento_parcelas_impressao(cnpj_contador: str, cnpj_contribuinte: str) -> Dict[str, Any]:
+    return body_parcelamento_servico(
+        cnpj_contador,
+        cnpj_contribuinte,
+        PARCELAMENTO_ID_SERVICO_PARCELAS_IMPRESSAO,
+        "",
+    )
 
 
 def body_parcelamento_emitir(cnpj_contador: str, cnpj_contribuinte: str, parcela_aaaamm: int) -> Dict[str, Any]:
-    return {
-        "contratante": {"numero": cnpj_contador, "tipo": 2},
-        "autorPedidoDados": {"numero": cnpj_contador, "tipo": 2},
-        "contribuinte": {"numero": cnpj_contribuinte, "tipo": infer_document_type(cnpj_contribuinte)},
-        "pedidoDados": {
-            "idSistema": PARCELAMENTO_ID_SISTEMA,
-            "idServico": PARCELAMENTO_ID_SERVICO_EMITIR,
-            "versaoSistema": PARCELAMENTO_VERSAO,
-            "dados": json.dumps({"parcelaParaEmitir": int(parcela_aaaamm)}, ensure_ascii=False),
-        },
-    }
+    return body_parcelamento_servico(
+        cnpj_contador,
+        cnpj_contribuinte,
+        PARCELAMENTO_ID_SERVICO_EMITIR,
+        {"parcelaParaEmitir": int(parcela_aaaamm)},
+    )
 
 
 def body_caixa_postal_lista(
@@ -993,6 +1052,162 @@ def summarize_parcelamento_payload(payload: Dict[str, Any], contribuinte_cnpj: s
     }
 
 
+def current_yyyymm() -> int:
+    return int(datetime.now().strftime("%Y%m"))
+
+
+def parse_int_digits(value: Any, default: Optional[int] = None) -> Optional[int]:
+    doc = digits(value)
+    if not doc:
+        return default
+    try:
+        return int(doc)
+    except Exception:
+        return default
+
+
+def parcelamento_service_result(id_servico: str, body: Dict[str, Any], status: int, resposta: Dict[str, Any]) -> Dict[str, Any]:
+    pedido = body.get("pedidoDados") if isinstance(body.get("pedidoDados"), dict) else {}
+    return {
+        "ok": status < 400,
+        "status_http": status,
+        "idSistema": pedido.get("idSistema"),
+        "idServico": id_servico,
+        "versaoSistema": pedido.get("versaoSistema"),
+        "dados_enviados": try_json(pedido.get("dados")),
+        "mensagem": first_not_empty(resposta, "mensagem", "message", "erro", "error", "raw"),
+        "dados_parseados": resposta.get("dados_parseados"),
+        "raw": resposta,
+    }
+
+
+def call_parcelamento_service(
+    session: requests.Session,
+    cert: Tuple[str, str],
+    access_token: str,
+    jwt_token: str,
+    body: Dict[str, Any],
+    url: str = URL_PARCELAMENTO_CONSULTAR,
+) -> Dict[str, Any]:
+    pedido = body.get("pedidoDados") if isinstance(body.get("pedidoDados"), dict) else {}
+    id_servico = str(pedido.get("idServico") or "")
+    status, resposta = post_json(
+        session,
+        url,
+        headers(access_token, jwt_token),
+        body,
+        cert,
+    )
+    return parcelamento_service_result(id_servico, body, status, resposta)
+
+
+def get_parcelamento_parcelamentos(payload: Any) -> List[Dict[str, Any]]:
+    rows = _pick_first_list(payload, ["parcelamentos", "listaParcelamentos", "pedidos", "lista"])
+    return [item for item in rows if isinstance(item, dict)]
+
+
+def is_parcelamento_encerrado(value: Any) -> bool:
+    text = _normalize_text(value).lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return any(token in text for token in ("encerr", "finaliz", "quit", "cancel", "indefer"))
+
+
+def escolher_numero_parcelamento(pedidos_payload: Any, numero_preferido: Optional[int] = None) -> Optional[int]:
+    if numero_preferido:
+        return int(numero_preferido)
+    pedidos = get_parcelamento_parcelamentos(pedidos_payload)
+    if not pedidos:
+        found = _pick_first_value(pedidos_payload, ["numero", "numeroParcelamento", "numParcelamento"])
+        return parse_int_digits(found)
+
+    ativo = None
+    for item in pedidos:
+        situacao = first_not_empty(item, "situacao", "status", "descricaoSituacao", "descricao_status")
+        if not is_parcelamento_encerrado(situacao):
+            ativo = item
+            break
+    escolhido = ativo or pedidos[0]
+    return parse_int_digits(first_not_empty(escolhido, "numero", "numeroParcelamento", "numParcelamento"))
+
+
+def get_parcelamento_parcelas_disponiveis(payload: Any) -> List[Dict[str, Any]]:
+    rows = _pick_first_list(payload, ["listaParcela", "parcelas", "parcelasDisponiveis", "parcelasParaGerar"])
+    return [item for item in rows if isinstance(item, dict)]
+
+
+def parcela_disponivel_para_emissao(parcelas_payload: Any, parcela_aaaamm: int) -> bool:
+    parcelas = get_parcelamento_parcelas_disponiveis(parcelas_payload)
+    if not parcelas:
+        return True
+    wanted = digits(parcela_aaaamm)
+    for item in parcelas:
+        parcela = digits(first_not_empty(item, "parcela", "anoMesParcela", "parcelaParaEmitir") or "")
+        if parcela == wanted:
+            return True
+    return False
+
+
+def summarize_parcelamento_consulta(
+    contribuinte_cnpj: str,
+    pedidos: Dict[str, Any],
+    detalhe: Optional[Dict[str, Any]],
+    pagamento: Optional[Dict[str, Any]],
+    parcelas_impressao: Optional[Dict[str, Any]],
+    numero_parcelamento: Optional[int],
+    ano_mes_parcela: int,
+) -> Dict[str, Any]:
+    pedidos_dados = pedidos.get("dados_parseados") if isinstance(pedidos, dict) else {}
+    detalhe_dados = detalhe.get("dados_parseados") if isinstance(detalhe, dict) else {}
+    pagamento_dados = pagamento.get("dados_parseados") if isinstance(pagamento, dict) else {}
+    parcelas_dados = parcelas_impressao.get("dados_parseados") if isinstance(parcelas_impressao, dict) else {}
+
+    pedidos_lista = get_parcelamento_parcelamentos(pedidos)
+    parcelas_lista = get_parcelamento_parcelas_disponiveis(parcelas_impressao)
+    situacao = (
+        _pick_first_value(detalhe_dados, ["situacao", "status", "descricaoSituacao", "descricao_status"])
+        or _pick_first_value(pedidos_dados, ["situacao", "status", "descricaoSituacao", "descricao_status"])
+        or ""
+    )
+    data_pedido = _pick_first_value(detalhe_dados, ["dataDoPedido", "dataPedido", "data_do_pedido"])
+    data_situacao = _pick_first_value(detalhe_dados, ["dataDaSituacao", "dataSituacao", "data_da_situacao"])
+    valor_parcela = _pick_first_value(parcelas_dados, ["valor", "valorParcela", "valor_parcela"])
+    data_pagamento = _pick_first_value(pagamento_dados, ["dataPagamento", "dataDeArrecadacao", "data_pagamento"])
+    valor_pago = _pick_first_value(pagamento_dados, ["valorPagoArrecadacao", "valorPago", "valor_pago"])
+    pago = bool(data_pagamento or _safe_float(valor_pago))
+    parcela_disponivel = parcela_disponivel_para_emissao(parcelas_impressao, ano_mes_parcela)
+
+    dado_atual = {
+        "numero": numero_parcelamento,
+        "situacao": situacao or "Em parcelamento",
+        "data_do_pedido": data_pedido,
+        "data_situacao": data_situacao,
+        "mes_parcela": ano_mes_parcela,
+        "parcela_atual_paga": pago,
+        "parcelamento_em_atraso": (not pago) and parcela_disponivel,
+        "valor_parcela": valor_parcela,
+        "data_pagamento": data_pagamento,
+        "valor_pago": valor_pago,
+    }
+
+    return {
+        "cnpj": contribuinte_cnpj,
+        "codigo": first_not_empty(pedidos, "status_http", "codigo", "_http_status"),
+        "mensagem": first_not_empty(pedidos, "mensagem", "message", "raw"),
+        "total_registros": len(pedidos_lista),
+        "possui_parcelamento": bool(pedidos_lista or numero_parcelamento),
+        "numero": numero_parcelamento,
+        "situacao": dado_atual["situacao"],
+        "mesParcela": ano_mes_parcela,
+        "parcela_atual_paga": pago,
+        "parcelamento_em_atraso": dado_atual["parcelamento_em_atraso"],
+        "dados": [dado_atual],
+        "pedidos": pedidos_lista[:20],
+        "parcelamento": detalhe_dados,
+        "detalhe_pagamento": pagamento_dados,
+        "parcelas_disponiveis": parcelas_lista,
+    }
+
+
 def normalize_assunto_modelo(mensagem: Dict[str, Any]) -> str:
     assunto = str(first_not_empty(mensagem, "assuntoModelo", "assunto", "assunto_modelo") or "")
     variavel = first_not_empty(mensagem, "valorParametroAssunto", "valor_parametro_assunto")
@@ -1220,23 +1435,75 @@ def consultar_parcelamento(
     jwt_token: str,
     cnpj_contador: str,
     cnpj_contribuinte: str,
+    numero_parcelamento: Optional[int] = None,
+    ano_mes_parcela: Optional[int] = None,
 ) -> Dict[str, Any]:
-    status, resposta = post_json(
+    ano_mes = int(ano_mes_parcela or current_yyyymm())
+
+    pedidos = call_parcelamento_service(
         session,
-        URL_PARCELAMENTO_CONSULTAR,
-        headers(access_token, jwt_token),
-        body_parcelamento_consultar(cnpj_contador, cnpj_contribuinte),
         cert,
+        access_token,
+        jwt_token,
+        body_parcelamento_consultar(cnpj_contador, cnpj_contribuinte),
     )
-    if status >= 400:
-        raise RuntimeError(first_not_empty(resposta, "mensagem", "message", "raw") or "Falha ao consultar parcelamento.")
+    if not pedidos.get("ok"):
+        raise RuntimeError(pedidos.get("mensagem") or "Falha ao consultar pedidos de parcelamento.")
+
+    numero = escolher_numero_parcelamento(pedidos, numero_parcelamento)
+    detalhe = None
+    pagamento = None
+
+    if numero:
+        detalhe = call_parcelamento_service(
+            session,
+            cert,
+            access_token,
+            jwt_token,
+            body_parcelamento_obter(cnpj_contador, cnpj_contribuinte, numero),
+        )
+        pagamento = call_parcelamento_service(
+            session,
+            cert,
+            access_token,
+            jwt_token,
+            body_parcelamento_detalhe_pagamento(cnpj_contador, cnpj_contribuinte, numero, ano_mes),
+        )
+
+    parcelas_impressao = call_parcelamento_service(
+        session,
+        cert,
+        access_token,
+        jwt_token,
+        body_parcelamento_parcelas_impressao(cnpj_contador, cnpj_contribuinte),
+    )
 
     return {
         "ok": True,
         "servico": "parcelamentos_consultar",
         "cnpj": cnpj_contribuinte,
         "sistema": PARCELAMENTO_ID_SISTEMA,
-        "resumo": summarize_parcelamento_payload(resposta, cnpj_contribuinte),
+        "numero_parcelamento": numero,
+        "ano_mes_parcela": ano_mes,
+        "resumo": summarize_parcelamento_consulta(
+            contribuinte_cnpj=cnpj_contribuinte,
+            pedidos=pedidos,
+            detalhe=detalhe,
+            pagamento=pagamento,
+            parcelas_impressao=parcelas_impressao,
+            numero_parcelamento=numero,
+            ano_mes_parcela=ano_mes,
+        ),
+        "pedidos": pedidos,
+        "detalhe": detalhe,
+        "detalhe_pagamento": pagamento,
+        "parcelas_impressao": parcelas_impressao,
+        "etapas": {
+            "pedidos": bool(pedidos.get("ok")),
+            "detalhe": bool(detalhe and detalhe.get("ok")),
+            "detalhe_pagamento": bool(pagamento and pagamento.get("ok")),
+            "parcelas_impressao": bool(parcelas_impressao.get("ok")),
+        },
     }
 
 
@@ -1250,17 +1517,35 @@ def emitir_parcelamento(
     parcela_aaaamm: int,
     return_pdf_base64: bool,
 ) -> Dict[str, Any]:
-    status, resposta = post_json(
+    parcelas_impressao = call_parcelamento_service(
         session,
-        URL_PARCELAMENTO_EMITIR,
-        headers(access_token, jwt_token),
-        body_parcelamento_emitir(cnpj_contador, cnpj_contribuinte, parcela_aaaamm),
         cert,
+        access_token,
+        jwt_token,
+        body_parcelamento_parcelas_impressao(cnpj_contador, cnpj_contribuinte),
     )
-    if status >= 400:
-        raise RuntimeError(first_not_empty(resposta, "mensagem", "message", "raw") or "Falha ao emitir DAS.")
+    if parcelas_impressao.get("ok") and not parcela_disponivel_para_emissao(parcelas_impressao, int(parcela_aaaamm)):
+        return {
+            "ok": False,
+            "servico": "parcelamentos_emitir",
+            "cnpj": cnpj_contribuinte,
+            "parcela_aaaamm": int(parcela_aaaamm),
+            "erro": "A parcela informada nao esta disponivel para impressao do DAS.",
+            "parcelas_impressao": parcelas_impressao,
+        }
 
-    dados = resposta.get("dados_parseados")
+    emissao = call_parcelamento_service(
+        session,
+        cert,
+        access_token,
+        jwt_token,
+        body_parcelamento_emitir(cnpj_contador, cnpj_contribuinte, parcela_aaaamm),
+        URL_PARCELAMENTO_EMITIR,
+    )
+    if not emissao.get("ok"):
+        raise RuntimeError(emissao.get("mensagem") or "Falha ao emitir DAS.")
+
+    dados = emissao.get("dados_parseados")
     pdf_b64 = None
     if isinstance(dados, dict):
         pdf_b64 = first_not_empty(dados, "docArrecadacaoPdfB64", "pdf", "pdfBase64", "arquivo")
@@ -1270,7 +1555,9 @@ def emitir_parcelamento(
         "servico": "parcelamentos_emitir",
         "cnpj": cnpj_contribuinte,
         "parcela_aaaamm": int(parcela_aaaamm),
-        "resumo": summarize_parcelamento_payload(resposta, cnpj_contribuinte),
+        "resumo": summarize_parcelamento_payload(emissao.get("raw") or emissao, cnpj_contribuinte),
+        "parcelas_impressao": parcelas_impressao,
+        "emissao": emissao,
     }
     if return_pdf_base64 and pdf_b64:
         retorno["pdf_base64"] = pdf_b64
@@ -2402,6 +2689,15 @@ def consultar_parcelamento_route():
     payload = request.get_json(silent=True) or {}
     consumer_key, consumer_secret, cnpj_contador = get_common_credentials(payload)
     contribuinte_cnpj = digits(payload.get("contribuinte_cnpj") or payload.get("cnpj"))
+    numero_parcelamento = parse_int_digits(
+        payload.get("numeroParcelamento") or payload.get("numero_parcelamento")
+    )
+    ano_mes_parcela = parse_int_digits(
+        payload.get("anoMesParcela")
+        or payload.get("ano_mes_parcela")
+        or payload.get("parcela_aaaamm"),
+        current_yyyymm(),
+    )
 
     if len(cnpj_contador) != 14:
         return jsonify({"ok": False, "erro": "Informe o CNPJ do contador com 14 digitos."}), 400
@@ -2426,6 +2722,8 @@ def consultar_parcelamento_route():
             jwt_token=auth["jwt_token"],
             cnpj_contador=cnpj_contador,
             cnpj_contribuinte=contribuinte_cnpj,
+            numero_parcelamento=numero_parcelamento,
+            ano_mes_parcela=ano_mes_parcela,
         )
         resultado["tokens"] = {"expires_in": auth.get("expires_in")}
         return jsonify(resultado)
@@ -2447,7 +2745,7 @@ def emitir_parcelamento_route():
     payload = request.get_json(silent=True) or {}
     consumer_key, consumer_secret, cnpj_contador = get_common_credentials(payload)
     contribuinte_cnpj = digits(payload.get("contribuinte_cnpj") or payload.get("cnpj"))
-    parcela_aaaamm = digits(payload.get("parcela_aaaamm"))
+    parcela_aaaamm = digits(payload.get("parcela_aaaamm") or payload.get("parcelaParaEmitir") or payload.get("parcela_para_emitir"))
     return_pdf_base64 = bool(payload.get("return_pdf_base64", True))
 
     if len(cnpj_contador) != 14:
