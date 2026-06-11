@@ -1106,33 +1106,114 @@ def get_parcelamento_parcelamentos(payload: Any) -> List[Dict[str, Any]]:
     return [item for item in rows if isinstance(item, dict)]
 
 
+def get_parcelamento_numero_from_item(item: Dict[str, Any]) -> Optional[int]:
+    if not isinstance(item, dict):
+        return None
+    value = first_not_empty(
+        item,
+        "numeroParcelamento",
+        "numParcelamento",
+        "numero_parcelamento",
+        "numero",
+    )
+    return parse_int_digits(value)
+
+
+def get_parcelamento_data_score(item: Dict[str, Any]) -> int:
+    if not isinstance(item, dict):
+        return 0
+    values = [
+        first_not_empty(item, "dataDoPedido", "dataPedido", "data_do_pedido"),
+        first_not_empty(item, "dataDaSituacao", "dataSituacao", "data_da_situacao"),
+        first_not_empty(item, "dataConsolidacao", "data_consolidacao"),
+    ]
+    scores = [parse_int_digits(value, 0) or 0 for value in values]
+    return max(scores) if scores else 0
+
+
 def is_parcelamento_encerrado(value: Any) -> bool:
     text = _normalize_text(value).lower()
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return any(token in text for token in ("encerr", "finaliz", "quit", "cancel", "indefer"))
 
 
-def escolher_numero_parcelamento(pedidos_payload: Any, numero_preferido: Optional[int] = None) -> Optional[int]:
-    if numero_preferido:
-        return int(numero_preferido)
-    pedidos = get_parcelamento_parcelamentos(pedidos_payload)
-    if not pedidos:
-        found = _pick_first_value(pedidos_payload, ["numero", "numeroParcelamento", "numParcelamento"])
-        return parse_int_digits(found)
-
-    ativo = None
-    for item in pedidos:
-        situacao = first_not_empty(item, "situacao", "status", "descricaoSituacao", "descricao_status")
-        if not is_parcelamento_encerrado(situacao):
-            ativo = item
-            break
-    escolhido = ativo or pedidos[0]
-    return parse_int_digits(first_not_empty(escolhido, "numero", "numeroParcelamento", "numParcelamento"))
+def is_parcelamento_item_encerrado(item: Dict[str, Any]) -> bool:
+    situacao = first_not_empty(item, "situacao", "status", "descricaoSituacao", "descricao_status")
+    return is_parcelamento_encerrado(situacao)
 
 
 def get_parcelamento_parcelas_disponiveis(payload: Any) -> List[Dict[str, Any]]:
     rows = _pick_first_list(payload, ["listaParcela", "parcelas", "parcelasDisponiveis", "parcelasParaGerar"])
     return [item for item in rows if isinstance(item, dict)]
+
+
+def get_numeros_from_parcelas_impressao(parcelas_payload: Any) -> List[int]:
+    numeros: List[int] = []
+    for item in get_parcelamento_parcelas_disponiveis(parcelas_payload):
+        numero = get_parcelamento_numero_from_item(item)
+        if numero and numero not in numeros:
+            numeros.append(numero)
+
+    direct = parse_int_digits(_pick_first_value(
+        parcelas_payload,
+        ["numeroParcelamento", "numParcelamento", "numero_parcelamento"],
+    ))
+    if direct and direct not in numeros:
+        numeros.append(direct)
+    return numeros
+
+
+def get_numeros_from_pedidos(pedidos_payload: Any) -> List[int]:
+    pedidos = get_parcelamento_parcelamentos(pedidos_payload)
+    if not pedidos:
+        parsed = pedidos_payload.get("dados_parseados") if isinstance(pedidos_payload, dict) else pedidos_payload
+        found = _pick_first_value(parsed, ["numeroParcelamento", "numParcelamento", "numero_parcelamento", "numero"])
+        numero = parse_int_digits(found)
+        return [numero] if numero else []
+
+    ordenados = sorted(
+        pedidos,
+        key=lambda item: (
+            0 if is_parcelamento_item_encerrado(item) else 1,
+            get_parcelamento_data_score(item),
+            get_parcelamento_numero_from_item(item) or 0,
+        ),
+        reverse=True,
+    )
+    numeros: List[int] = []
+    for item in ordenados:
+        numero = get_parcelamento_numero_from_item(item)
+        if numero and numero not in numeros:
+            numeros.append(numero)
+    return numeros
+
+
+def get_parcelamento_numeros_candidatos(
+    pedidos_payload: Any,
+    parcelas_payload: Any,
+    numero_preferido: Optional[int] = None,
+) -> List[int]:
+    numeros: List[int] = []
+    # As parcelas disponíveis para impressão representam o parcelamento apto
+    # a gerar DAS, então elas têm prioridade sobre histórico encerrado.
+    for numero in get_numeros_from_parcelas_impressao(parcelas_payload):
+        if numero and numero not in numeros:
+            numeros.append(numero)
+    for numero in get_numeros_from_pedidos(pedidos_payload):
+        if numero and numero not in numeros:
+            numeros.append(numero)
+    if numero_preferido and numero_preferido not in numeros:
+        numeros.append(int(numero_preferido))
+    return numeros
+
+
+def detalhe_indica_parcelamento_encerrado(detalhe: Optional[Dict[str, Any]]) -> bool:
+    if not detalhe:
+        return False
+    dados = detalhe.get("dados_parseados") if isinstance(detalhe, dict) else {}
+    source = dados if dados not in (None, "", [], {}) else detalhe
+    situacao = _pick_first_value(source, ["situacao", "status", "descricaoSituacao", "descricao_status"])
+    return is_parcelamento_encerrado(situacao)
 
 
 def parcela_disponivel_para_emissao(parcelas_payload: Any, parcela_aaaamm: int) -> bool:
@@ -1450,25 +1531,8 @@ def consultar_parcelamento(
     if not pedidos.get("ok"):
         raise RuntimeError(pedidos.get("mensagem") or "Falha ao consultar pedidos de parcelamento.")
 
-    numero = escolher_numero_parcelamento(pedidos, numero_parcelamento)
     detalhe = None
     pagamento = None
-
-    if numero:
-        detalhe = call_parcelamento_service(
-            session,
-            cert,
-            access_token,
-            jwt_token,
-            body_parcelamento_obter(cnpj_contador, cnpj_contribuinte, numero),
-        )
-        pagamento = call_parcelamento_service(
-            session,
-            cert,
-            access_token,
-            jwt_token,
-            body_parcelamento_detalhe_pagamento(cnpj_contador, cnpj_contribuinte, numero, ano_mes),
-        )
 
     parcelas_impressao = call_parcelamento_service(
         session,
@@ -1478,12 +1542,44 @@ def consultar_parcelamento(
         body_parcelamento_parcelas_impressao(cnpj_contador, cnpj_contribuinte),
     )
 
+    candidatos = get_parcelamento_numeros_candidatos(
+        pedidos_payload=pedidos,
+        parcelas_payload=parcelas_impressao,
+        numero_preferido=numero_parcelamento,
+    )
+    numero = candidatos[0] if candidatos else None
+
+    for candidato in candidatos:
+        tentativa = call_parcelamento_service(
+            session,
+            cert,
+            access_token,
+            jwt_token,
+            body_parcelamento_obter(cnpj_contador, cnpj_contribuinte, candidato),
+        )
+        if detalhe is None or tentativa.get("ok"):
+            detalhe = tentativa
+            numero = candidato
+
+        if tentativa.get("ok") and not detalhe_indica_parcelamento_encerrado(tentativa):
+            break
+
+    if numero:
+        pagamento = call_parcelamento_service(
+            session,
+            cert,
+            access_token,
+            jwt_token,
+            body_parcelamento_detalhe_pagamento(cnpj_contador, cnpj_contribuinte, numero, ano_mes),
+        )
+
     return {
         "ok": True,
         "servico": "parcelamentos_consultar",
         "cnpj": cnpj_contribuinte,
         "sistema": PARCELAMENTO_ID_SISTEMA,
         "numero_parcelamento": numero,
+        "numeros_candidatos": candidatos,
         "ano_mes_parcela": ano_mes,
         "resumo": summarize_parcelamento_consulta(
             contribuinte_cnpj=cnpj_contribuinte,
@@ -2689,8 +2785,15 @@ def consultar_parcelamento_route():
     payload = request.get_json(silent=True) or {}
     consumer_key, consumer_secret, cnpj_contador = get_common_credentials(payload)
     contribuinte_cnpj = digits(payload.get("contribuinte_cnpj") or payload.get("cnpj"))
-    numero_parcelamento = parse_int_digits(
-        payload.get("numeroParcelamento") or payload.get("numero_parcelamento")
+    usar_numero_explicito = parse_bool_field(
+        payload.get("usar_numero_parcelamento_explicito")
+        or payload.get("usarNumeroParcelamentoExplicito"),
+        False,
+    )
+    numero_parcelamento = (
+        parse_int_digits(payload.get("numeroParcelamento") or payload.get("numero_parcelamento"))
+        if usar_numero_explicito
+        else None
     )
     ano_mes_parcela = parse_int_digits(
         payload.get("anoMesParcela")
