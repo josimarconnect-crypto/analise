@@ -91,6 +91,11 @@ CND_CERTIDAO_URL = os.getenv(
 CND_STATUS7_WAIT_MS = int(os.getenv("CND_STATUS7_WAIT_MS", "500"))
 CND_MAX_TENTATIVAS = int(os.getenv("CND_MAX_TENTATIVAS", "12"))
 CND_OUTPUT_DIR = os.getenv("CND_OUTPUT_DIR", "jsoncnd").strip() or "jsoncnd"
+NFE_CONSULTA_CHAVE_URL = os.getenv(
+    "NFE_CONSULTA_CHAVE_URL",
+    "https://www.geradordanfe.com.br/api/consulta-chave",
+).strip()
+NFE_CONSULTA_CHAVE_TIMEOUT = int(os.getenv("NFE_CONSULTA_CHAVE_TIMEOUT", "70"))
 
 app = Flask(__name__)
 CORS(app)
@@ -105,6 +110,37 @@ def infer_document_type(value: Any) -> int:
     if len(doc) == 11:
         return 1
     return 2
+
+
+NFE_UF_CODES = {
+    "11", "12", "13", "14", "15", "16", "17",
+    "21", "22", "23", "24", "25", "26", "27",
+    "28", "29", "31", "32", "33", "35", "41",
+    "42", "43", "50", "51", "52", "53",
+}
+
+
+def calculate_nfe_access_key_digit(key43: str) -> int:
+    total = 0
+    weight = 2
+    for char in reversed(str(key43 or "")):
+        total += int(char) * weight
+        weight = 2 if weight == 9 else weight + 1
+    remainder = total % 11
+    return 0 if remainder < 2 else 11 - remainder
+
+
+def is_valid_nfe55_access_key(value: Any) -> bool:
+    key = digits(value)
+    if len(key) != 44:
+        return False
+    if key == key[:1] * 44:
+        return False
+    if key[:2] not in NFE_UF_CODES:
+        return False
+    if key[20:22] != "55":
+        return False
+    return calculate_nfe_access_key_digit(key[:43]) == int(key[43])
 
 
 def decode_cert(value: str) -> bytes:
@@ -3953,6 +3989,73 @@ def buscar_nome_sem_certificado_route():
         return jsonify({"ok": False, "erro": str(exc), "documento": documento}), 500
 
 
+@app.post("/api/consulta-chave")
+def consultar_nfe_por_chave_route():
+    payload = request.get_json(silent=True) or {}
+    chave = digits(payload.get("chave") or payload.get("access_key") or payload.get("chave_acesso") or "")
+    formato = str(payload.get("format") or "json").strip().lower() or "json"
+
+    if not is_valid_nfe55_access_key(chave):
+        return jsonify({
+            "ok": False,
+            "message": "Informe uma chave valida de NF-e modelo 55 com 44 digitos.",
+            "chave": chave,
+        }), 400
+
+    upstream_payload = {
+        "chave": chave,
+        "format": "json" if formato not in {"json"} else formato,
+    }
+
+    try:
+        session = requests.Session()
+        resp = session.post(
+            NFE_CONSULTA_CHAVE_URL,
+            json=upstream_payload,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "ComunidadeFiscal/1.0",
+            },
+            timeout=NFE_CONSULTA_CHAVE_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "message": f"Falha ao consultar DANFE externa: {exc}",
+            "chave": chave,
+        }), 502
+
+    try:
+        resposta = resp.json()
+    except Exception:
+        resposta = {
+            "message": (resp.text or "").strip()[:4000] or "Resposta invalida do servico de consulta.",
+        }
+
+    if not isinstance(resposta, dict):
+        resposta = {"resultado": resposta}
+
+    if not resp.ok:
+        message = str(
+            resposta.get("message")
+            or resposta.get("erro")
+            or resposta.get("error")
+            or "Nao foi possivel consultar a nota fiscal."
+        ).strip()
+        return jsonify({
+            "ok": False,
+            "message": message,
+            "status_http": resp.status_code,
+            "chave": chave,
+        }), resp.status_code
+
+    resposta.setdefault("ok", True)
+    resposta.setdefault("chave", chave)
+    resposta.setdefault("status_http", resp.status_code)
+    return jsonify(resposta), 200
+
+
 @app.get("/health")
 def health():
     return jsonify({
@@ -3981,6 +4084,7 @@ def health():
             "/integra-eprocesso/processos/consultar",
             "/integra-monitoramento/eventos/executar",
             "/integra-cadastro/sem-certificado/buscar-nome",
+            "/api/consulta-chave",
         ],
     })
 
