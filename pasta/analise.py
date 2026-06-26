@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 import re
@@ -951,8 +952,9 @@ def ncm_reforma(ncm: str = Query(...)) -> Dict[str, Any]:
         raise HTTPException(502, "A fonte federal de NCM retornou uma resposta invalida.")
 
     try:
-        dados = resposta.json()
-    except ValueError as exc:
+        # A fonte responde UTF-8 com BOM; requests.json() rejeita esse prefixo.
+        dados = json.loads(resposta.content.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError) as exc:
         logger.warning("NCM_REFORMA_UPSTREAM_JSON | ncm=%s", codigo)
         raise HTTPException(502, "A fonte federal de NCM nao retornou JSON valido.") from exc
 
