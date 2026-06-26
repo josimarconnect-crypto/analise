@@ -958,9 +958,10 @@ def ncm_reforma(ncm: str = Query(...)) -> Dict[str, Any]:
         logger.warning("NCM_REFORMA_UPSTREAM_JSON | ncm=%s", codigo)
         raise HTTPException(502, "A fonte federal de NCM nao retornou JSON valido.") from exc
 
-    resultados = dados.get("results") if isinstance(dados, dict) else None
-    resultado = resultados[0] if isinstance(resultados, list) and resultados else None
-    return {"ok": True, "ncm": codigo, "result": resultado}
+    resultados = dados.get("results") if isinstance(dados, dict) else []
+    if not isinstance(resultados, list):
+        resultados = []
+    return {"ok": True, "ncm": codigo, "results": resultados, "total": len(resultados)}
 
 
 
