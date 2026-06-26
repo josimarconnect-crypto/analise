@@ -67,6 +67,7 @@ URL_CONSULTA_DEBITOS_LISTA = "https://portalcontribuinte.sefin.ro.gov.br/app/con
 
 BASE_INTERNAMENTO = "https://internamentonotas.sefin.ro.gov.br"
 BASE_CONTA_CORRENTE = "https://portalcontribuinte.sefin.ro.gov.br/app/contacorrente/"
+URL_NCM_REFORMA = "https://mvsistema.com/BuscaNCM/conexao/proxy_ncm.php"
 
 
 logger = logging.getLogger("analise")
@@ -889,6 +890,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 def root() -> Dict[str, Any]:
     routes = [
         "/health",
+        "/ncm/reforma",
         "/empresas",
         "/debitos",
         "/extrato-produto",
@@ -918,6 +920,45 @@ def root() -> Dict[str, Any]:
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {"ok": True, "date_utc": _now_iso()}
+
+
+@app.get("/ncm/reforma")
+def ncm_reforma(ncm: str = Query(...)) -> Dict[str, Any]:
+    """Consulta, de forma restrita, as regras federais IBS/CBS de um NCM."""
+    codigo = re.sub(r"\D", "", str(ncm or ""))
+    if len(codigo) != 8:
+        raise HTTPException(400, "ncm deve conter exatamente 8 digitos.")
+
+    try:
+        resposta = requests.get(
+            URL_NCM_REFORMA,
+            params={"ncm": codigo},
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "ComunidadeFiscal/1.0 (+https://comunidadefiscal.com.br)",
+            },
+            timeout=(5, 20),
+            allow_redirects=False,
+        )
+    except requests.exceptions.RequestException as exc:
+        logger.warning("NCM_REFORMA_UPSTREAM_ERROR | ncm=%s | err=%s", codigo, str(exc))
+        raise HTTPException(502, "Falha ao consultar a fonte federal de NCM.") from exc
+
+    if resposta.status_code == 429:
+        raise HTTPException(429, "A fonte federal de NCM limitou temporariamente as consultas.")
+    if not resposta.ok:
+        logger.warning("NCM_REFORMA_UPSTREAM_HTTP | ncm=%s | status=%s", codigo, resposta.status_code)
+        raise HTTPException(502, "A fonte federal de NCM retornou uma resposta invalida.")
+
+    try:
+        dados = resposta.json()
+    except ValueError as exc:
+        logger.warning("NCM_REFORMA_UPSTREAM_JSON | ncm=%s", codigo)
+        raise HTTPException(502, "A fonte federal de NCM nao retornou JSON valido.") from exc
+
+    resultados = dados.get("results") if isinstance(dados, dict) else None
+    resultado = resultados[0] if isinstance(resultados, list) and resultados else None
+    return {"ok": True, "ncm": codigo, "result": resultado}
 
 
 
