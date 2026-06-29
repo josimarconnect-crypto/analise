@@ -694,11 +694,11 @@ def _buscar_url_acesso_digital_em_html(html: str, base_url: str) -> Optional[str
 
     for tag in soup.find_all(attrs={"onclick": True}):
         onclick = tag.get("onclick") or ""
-        match = re.search(r"(?:href\s*=\s*|window\.location(?:\.href)?\s*=\s*|open\(['\"])(https?://[^")'\s]+)", onclick)
+        match = re.search(r"(?:href\s*=\s*|window\.location(?:\.href)?\s*=\s*|open\(['\"])(https?://[^\)\"'\s]+)", onclick)
         if match and "acesso_digital" in match.group(1):
             return match.group(1)
 
-    match = re.search(r"https?://[^"]*acesso_digital[^"]*", html)
+    match = re.search(r"https?://[^\"]*acesso_digital[^\"]*", html)
     if match:
         return match.group(0)
 
