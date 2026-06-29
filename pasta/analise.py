@@ -716,6 +716,7 @@ def _seguir_link_acesso_digital_if_present(
     try:
         current_html = html
         current_url = base_url
+        last_response: Optional[requests.Response] = None
         for _ in range(4):
             soup = BeautifulSoup(current_html, "lxml")
             form = None
@@ -744,17 +745,18 @@ def _seguir_link_acesso_digital_if_present(
             else:
                 url_digital = _buscar_url_acesso_digital_em_html(current_html, current_url)
                 if not url_digital:
-                    return None
+                    return last_response
                 logger.info("Seguindo link de acesso digital: %s", url_digital)
                 resp = request_com_proxy(sess, "GET", url_digital, proxy_rotator=proxy_rotator, timeout=60, allow_redirects=True)
 
             if resp is None:
                 return None
+            last_response = resp
             if resp.text == current_html:
                 return resp
             current_html = resp.text
             current_url = resp.url or current_url
-        return resp
+        return last_response
     except Exception as exc:
         logger.warning("Falha ao seguir acesso digital: %s", exc)
         return None
@@ -1241,6 +1243,10 @@ def extrato_produto(
                     "cte_chaves_total": [],
                 },
             }
+
+        notas_meta = notas_meta[:max_notas]
+        notas_out: List[Dict[str, Any]] = []
+        cte_total_set = set()
 
         for meta in notas_meta:
             chave_nfe = meta["chave_nfe"]
