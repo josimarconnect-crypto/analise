@@ -684,32 +684,79 @@ def _resolver_url_cteconsulta(rel: str) -> str:
     return requests.compat.urljoin(BASE_CONTA_CORRENTE, rel)
 
 
+def _buscar_url_acesso_digital_em_html(html: str, base_url: str) -> Optional[str]:
+    soup = BeautifulSoup(html, "lxml")
+
+    for a in soup.find_all("a", href=True):
+        href = a.get("href") or ""
+        if "acesso_digital" in href or ("/acesso_externo/" in href and "digital" in href):
+            return href if href.startswith("http") else requests.compat.urljoin(base_url, href)
+
+    for tag in soup.find_all(attrs={"onclick": True}):
+        onclick = tag.get("onclick") or ""
+        match = re.search(r"(?:href\s*=\s*|window\.location(?:\.href)?\s*=\s*|open\(['\"])(https?://[^")'\s]+)", onclick)
+        if match and "acesso_digital" in match.group(1):
+            return match.group(1)
+
+    match = re.search(r"https?://[^"]*acesso_digital[^"]*", html)
+    if match:
+        return match.group(0)
+
+    return None
+
+
 def _seguir_link_acesso_digital_if_present(
     sess: requests.Session, html: str, base_url: str, proxy_rotator: Optional[ProxyRotator] = None
 ) -> Optional[requests.Response]:
     """
-    Procura na página HTML por um link para `/acesso_externo/acesso_digital` (ou similar)
-    e, se encontrado, faz uma requisição com a sessão mTLS (certificado já configurado).
-    Retorna a Response do pedido ao link de acesso digital ou None se não encontrou.
+    Procura na página HTML por um fluxo de acesso via certificado.
+    Pode seguir um link `acesso_digital` ou submeter o formulário da página.
+    Retorna a Response final se o fluxo for seguido com sucesso.
     """
     try:
-        soup = BeautifulSoup(html, "lxml")
-        # Procura por links cujo href contenha acesso_digital ou /acesso_externo/acesso_digital
-        anchor = None
-        for a in soup.find_all("a", href=True):
-            href = a.get("href") or ""
-            if "acesso_digital" in href or "/acesso_externo/" in href and "digital" in href:
-                anchor = a
-                break
+        current_html = html
+        current_url = base_url
+        for _ in range(4):
+            soup = BeautifulSoup(current_html, "lxml")
+            form = None
+            for candidate in soup.find_all("form"):
+                action = (candidate.get("action") or "").strip()
+                if "acesso_digital" in action or candidate.find("input", {"name": "autenticacao"}):
+                    form = candidate
+                    break
 
-        if not anchor:
-            return None
+            if form is not None:
+                action = form.get("action") or ""
+                if not action.startswith("http"):
+                    action = requests.compat.urljoin(current_url, action)
+                data = {
+                    inp.get("name"): inp.get("value", "") or ""
+                    for inp in form.find_all("input")
+                    if inp.get("name")
+                }
+                for button in form.find_all("button"):
+                    if button.get("name"):
+                        data[button.get("name")] = button.get("value", "") or ""
+                if "autenticacao" not in data or not data.get("autenticacao"):
+                    data["autenticacao"] = "certificado"
+                logger.info("Submetendo formulario de acesso digital para %s com dados=%s", action, {k: v for k, v in data.items() if k != 'password'})
+                resp = request_com_proxy(sess, "POST", action, proxy_rotator=proxy_rotator, data=data, timeout=60, allow_redirects=True)
+            else:
+                url_digital = _buscar_url_acesso_digital_em_html(current_html, current_url)
+                if not url_digital:
+                    return None
+                logger.info("Seguindo link de acesso digital: %s", url_digital)
+                resp = request_com_proxy(sess, "GET", url_digital, proxy_rotator=proxy_rotator, timeout=60, allow_redirects=True)
 
-        href = anchor.get("href") or ""
-        target = href if href.startswith("http") else requests.compat.urljoin(base_url, href)
-        resp = request_com_proxy(sess, "GET", target, proxy_rotator=proxy_rotator, timeout=60, allow_redirects=True)
+            if resp is None:
+                return None
+            if resp.text == current_html:
+                return resp
+            current_html = resp.text
+            current_url = resp.url or current_url
         return resp
-    except Exception:
+    except Exception as exc:
+        logger.warning("Falha ao seguir acesso digital: %s", exc)
         return None
 
 
