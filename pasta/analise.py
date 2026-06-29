@@ -684,6 +684,35 @@ def _resolver_url_cteconsulta(rel: str) -> str:
     return requests.compat.urljoin(BASE_CONTA_CORRENTE, rel)
 
 
+def _seguir_link_acesso_digital_if_present(
+    sess: requests.Session, html: str, base_url: str, proxy_rotator: Optional[ProxyRotator] = None
+) -> Optional[requests.Response]:
+    """
+    Procura na página HTML por um link para `/acesso_externo/acesso_digital` (ou similar)
+    e, se encontrado, faz uma requisição com a sessão mTLS (certificado já configurado).
+    Retorna a Response do pedido ao link de acesso digital ou None se não encontrou.
+    """
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        # Procura por links cujo href contenha acesso_digital ou /acesso_externo/acesso_digital
+        anchor = None
+        for a in soup.find_all("a", href=True):
+            href = a.get("href") or ""
+            if "acesso_digital" in href or "/acesso_externo/" in href and "digital" in href:
+                anchor = a
+                break
+
+        if not anchor:
+            return None
+
+        href = anchor.get("href") or ""
+        target = href if href.startswith("http") else requests.compat.urljoin(base_url, href)
+        resp = request_com_proxy(sess, "GET", target, proxy_rotator=proxy_rotator, timeout=60, allow_redirects=True)
+        return resp
+    except Exception:
+        return None
+
+
 def _extrair_chave_da_query(url: str) -> Optional[str]:
     if not url:
         return None
@@ -1172,6 +1201,13 @@ def extrato_produto(
 
             try:
                 internamento = request_com_proxy(sess, "GET", url_capa, proxy_rotator=proxy_rotator, timeout=70, allow_redirects=True)
+                # Se a página carregada for a tela SSO que exige selecionar "ACESSO VIA CERT. DIGITAL",
+                # tentamos seguir o link para acesso digital usando a mesma sessão (mTLS).
+                if internamento.status_code == 200:
+                    sso_follow = _seguir_link_acesso_digital_if_present(sess, internamento.text, internamento.url or url_capa, proxy_rotator=proxy_rotator)
+                    if sso_follow is not None and sso_follow.status_code == 200:
+                        internamento = sso_follow
+
                 if internamento.status_code != 200:
                     itens_payload = {
                         "ok": False,
