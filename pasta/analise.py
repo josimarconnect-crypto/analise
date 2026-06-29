@@ -1229,18 +1229,18 @@ def extrato_produto(
                 "empresa": cert.get("empresa") or "",
                 "result": {
                     "ok": True,
+                    "final_url": resp.url,
                     "final_url_extrato": resp.url,
                     "token_found": bool(token),
                     "usuario": usuario,
                     "total_notas_nfe": 0,
                     "notas_nfe": [],
+                    "notas": [],
+                    "nfe": [],
+                    "nfes": [],
                     "cte_chaves_total": [],
                 },
             }
-
-        notas_meta = notas_meta[:max_notas]
-        notas_out: List[Dict[str, Any]] = []
-        cte_total_set = set()
 
         for meta in notas_meta:
             chave_nfe = meta["chave_nfe"]
@@ -1300,6 +1300,9 @@ def extrato_produto(
                 {
                     "chave_nfe": chave_nfe,
                     "internamento_url": url_capa,
+                    "view_url": url_capa,
+                    "danfe_url": url_capa,
+                    "url": url_capa,
                     "cte_url": cte_url,
                     "cte_chaves": cte_chaves,
                     "itens_da_nota": itens_payload,
@@ -1313,11 +1316,15 @@ def extrato_produto(
             "empresa": cert.get("empresa") or "",
             "result": {
                 "ok": True,
+                "final_url": resp.url,
                 "final_url_extrato": resp.url,
                 "token_found": bool(token),
                 "usuario": usuario,
                 "total_notas_nfe": len(notas_out),
                 "notas_nfe": notas_out,
+                "notas": notas_out,
+                "nfe": notas_out,
+                "nfes": notas_out,
                 "cte_chaves_total": sorted(list(cte_total_set)),
             },
         }
